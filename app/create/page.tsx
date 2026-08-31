@@ -1,26 +1,115 @@
 "use client";
 
 import { motion } from "motion/react";
-import { ArrowLeft, Minus, Plus, Users, Timer, MessageCircle } from "lucide-react";
+import {
+  ArrowLeft,
+  Minus,
+  Plus,
+  Users,
+  Timer,
+  MessageCircle,
+  User,
+  Sparkles,
+} from "lucide-react";
 import Link from "next/link";
 import { useState } from "react";
+import { useRouter } from "next/navigation";
 
 const roundOptions = [3, 5, 7, 10];
 const clueOptions = [15, 30, 45];
 const discussionOptions = [30, 60, 90];
 
+const generateRoomCode = () => {
+  const characters =
+    "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+  let code = "";
+
+  for (let i = 0; i < 5; i++) {
+    code +=
+      characters[
+        Math.floor(Math.random() * characters.length)
+      ];
+  }
+
+  return code;
+};
+
+const getPlayerId = () => {
+  const existing = localStorage.getItem(
+    "imposter_player_id",
+  );
+
+  if (existing) {
+    return existing;
+  }
+
+  const id = crypto.randomUUID();
+
+  localStorage.setItem("imposter_player_id", id);
+
+  return id;
+};
+
 export default function CreateGame() {
+  const router = useRouter();
+
+  const [name, setName] = useState("");
+
   const [players, setPlayers] = useState(5);
   const [rounds, setRounds] = useState(5);
   const [clueTime, setClueTime] = useState(30);
-  const [discussionTime, setDiscussionTime] = useState(60);
+  const [discussionTime, setDiscussionTime] =
+    useState(60);
+
+  const [creating, setCreating] = useState(false);
 
   const decreasePlayers = () => {
-    setPlayers((current) => Math.max(4, current - 1));
+    setPlayers((current) =>
+      Math.max(4, current - 1),
+    );
   };
 
   const increasePlayers = () => {
-    setPlayers((current) => Math.min(10, current + 1));
+    setPlayers((current) =>
+      Math.min(10, current + 1),
+    );
+  };
+
+  const createRoom = () => {
+    const cleanName = name.trim();
+
+    if (!cleanName) {
+      return;
+    }
+
+    setCreating(true);
+
+    const playerId = getPlayerId();
+
+    localStorage.setItem(
+      "imposter_player_name",
+      cleanName,
+    );
+
+    localStorage.setItem(
+      "imposter_room_settings",
+      JSON.stringify({
+        players,
+        rounds,
+        clueTime,
+        discussionTime,
+      }),
+    );
+
+    localStorage.setItem(
+      "imposter_room_host",
+      "true",
+    );
+
+    const roomCode = generateRoomCode();
+
+    router.push(`/room/${roomCode}`);
   };
 
   return (
@@ -61,14 +150,14 @@ export default function CreateGame() {
       {/* Header */}
       <header className="relative z-10 flex items-center px-5 py-5 sm:px-8">
         <Link href="/">
-          <motion.button
+          <motion.div
             whileHover={{ x: -2 }}
             whileTap={{ scale: 0.94 }}
             className="flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-4 py-2.5 text-sm text-white/60 backdrop-blur-xl transition-colors hover:bg-white/10 hover:text-white"
           >
             <ArrowLeft className="h-4 w-4" />
             Back
-          </motion.button>
+          </motion.div>
         </Link>
       </header>
 
@@ -81,29 +170,68 @@ export default function CreateGame() {
           transition={{ duration: 0.6 }}
           className="mb-8"
         >
-          <p className="mb-2 text-sm font-medium uppercase tracking-[0.25em] text-violet-300/60">
+          <div className="mb-3 flex items-center gap-2 text-sm font-medium uppercase tracking-[0.25em] text-violet-300/60">
+            <Sparkles className="h-4 w-4" />
             Game setup
-          </p>
+          </div>
 
           <h1 className="text-4xl font-semibold tracking-[-0.04em] sm:text-5xl">
             Create Game
           </h1>
 
           <p className="mt-3 text-sm leading-6 text-white/40 sm:text-base">
-            Configure the game before inviting your friends.
+            Configure the game before inviting your
+            friends.
           </p>
         </motion.div>
 
-        {/* Settings */}
         <motion.div
           initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0}}
+          animate={{ opacity: 1, y: 0 }}
           transition={{
             delay: 0.1,
             duration: 0.6,
           }}
           className="space-y-4"
         >
+          {/* Name */}
+          <div className="rounded-3xl border border-white/10 bg-white/[0.045] p-5 backdrop-blur-xl sm:p-6">
+            <div className="flex items-center gap-3">
+              <div className="rounded-xl bg-violet-400/10 p-2.5">
+                <User className="h-5 w-5 text-violet-300" />
+              </div>
+
+              <div>
+                <h2 className="font-medium">
+                  Your name
+                </h2>
+
+                <p className="text-xs text-white/35">
+                  What should your friends call you?
+                </p>
+              </div>
+            </div>
+
+            <input
+              value={name}
+              onChange={(event) =>
+                setName(event.target.value.slice(0, 20))
+              }
+              onKeyDown={(event) => {
+                if (
+                  event.key === "Enter" &&
+                  name.trim()
+                ) {
+                  createRoom();
+                }
+              }}
+              placeholder="Enter your name"
+              maxLength={20}
+              autoComplete="nickname"
+              className="mt-5 h-13 w-full rounded-2xl border border-white/10 bg-black/20 px-4 text-sm text-white outline-none placeholder:text-white/25 transition-all focus:border-violet-300/30 focus:bg-white/[0.06]"
+            />
+          </div>
+
           {/* Players */}
           <div className="rounded-3xl border border-white/10 bg-white/[0.045] p-5 backdrop-blur-xl sm:p-6">
             <div className="flex items-center gap-3">
@@ -112,8 +240,13 @@ export default function CreateGame() {
               </div>
 
               <div>
-                <h2 className="font-medium">Players</h2>
-                <p className="text-xs text-white/35">4–10 players</p>
+                <h2 className="font-medium">
+                  Players
+                </h2>
+
+                <p className="text-xs text-white/35">
+                  4–10 players
+                </p>
               </div>
             </div>
 
@@ -129,11 +262,19 @@ export default function CreateGame() {
 
               <motion.div
                 key={players}
-                initial={{ opacity: 0, scale: 0.8 }}
-                animate={{ opacity: 1, scale: 1 }}
+                initial={{
+                  opacity: 0,
+                  scale: 0.8,
+                }}
+                animate={{
+                  opacity: 1,
+                  scale: 1,
+                }}
                 className="w-16 text-center"
               >
-                <span className="text-4xl font-semibold">{players}</span>
+                <span className="text-4xl font-semibold">
+                  {players}
+                </span>
               </motion.div>
 
               <motion.button
@@ -149,7 +290,9 @@ export default function CreateGame() {
 
           {/* Rounds */}
           <SettingCard
-            icon={<Timer className="h-5 w-5 text-violet-300" />}
+            icon={
+              <Timer className="h-5 w-5 text-violet-300" />
+            }
             title="Rounds"
             subtitle="How long the game lasts"
           >
@@ -163,7 +306,9 @@ export default function CreateGame() {
 
           {/* Clue time */}
           <SettingCard
-            icon={<Timer className="h-5 w-5 text-violet-300" />}
+            icon={
+              <Timer className="h-5 w-5 text-violet-300" />
+            }
             title="Clue time"
             subtitle="Time each player gets"
           >
@@ -177,7 +322,9 @@ export default function CreateGame() {
 
           {/* Discussion */}
           <SettingCard
-            icon={<MessageCircle className="h-5 w-5 text-violet-300" />}
+            icon={
+              <MessageCircle className="h-5 w-5 text-violet-300" />
+            }
             title="Discussion"
             subtitle="Time to argue and accuse"
           >
@@ -190,10 +337,16 @@ export default function CreateGame() {
           </SettingCard>
         </motion.div>
 
-        {/* Create button */}
+        {/* Create */}
         <motion.button
-          initial={{ opacity: 0, y: 15 }}
-          animate={{ opacity: 1, y: 0 }}
+          initial={{
+            opacity: 0,
+            y: 15,
+          }}
+          animate={{
+            opacity: 1,
+            y: 0,
+          }}
           transition={{
             delay: 0.35,
             duration: 0.6,
@@ -205,9 +358,11 @@ export default function CreateGame() {
           whileTap={{
             scale: 0.98,
           }}
-          className="mt-7 h-14 w-full rounded-2xl bg-white text-base font-semibold text-[#0b0b12] shadow-2xl shadow-white/5 transition-shadow hover:shadow-white/10"
+          disabled={!name.trim() || creating}
+          onClick={createRoom}
+          className="mt-7 h-14 w-full rounded-2xl bg-white text-base font-semibold text-[#0b0b12] shadow-2xl shadow-white/5 transition-all hover:shadow-white/10 disabled:cursor-not-allowed disabled:opacity-40"
         >
-          Create Room
+          {creating ? "Creating room..." : "Create Room"}
         </motion.button>
       </section>
     </main>
@@ -228,11 +383,16 @@ function SettingCard({
   return (
     <div className="rounded-3xl border border-white/10 bg-white/[0.045] p-5 backdrop-blur-xl sm:p-6">
       <div className="flex items-center gap-3">
-        <div className="rounded-xl bg-violet-400/10 p-2.5">{icon}</div>
+        <div className="rounded-xl bg-violet-400/10 p-2.5">
+          {icon}
+        </div>
 
         <div>
           <h2 className="font-medium">{title}</h2>
-          <p className="text-xs text-white/35">{subtitle}</p>
+
+          <p className="text-xs text-white/35">
+            {subtitle}
+          </p>
         </div>
       </div>
 
@@ -270,7 +430,7 @@ function OptionGroup({
           >
             {isSelected && (
               <motion.div
-                layoutId={`selected-${suffix}`}
+                layoutId={`selected-${suffix}-${option}`}
                 className="absolute inset-0 rounded-xl bg-violet-400/5"
               />
             )}
