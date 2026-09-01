@@ -46,7 +46,10 @@ const getPlayerId = () => {
 
   const id = crypto.randomUUID();
 
-  localStorage.setItem("imposter_player_id", id);
+  localStorage.setItem(
+    "imposter_player_id",
+    id,
+  );
 
   return id;
 };
@@ -85,13 +88,50 @@ export default function CreateGame() {
 
     setCreating(true);
 
+    /*
+     * ------------------------------------------------
+     * PLAYER IDENTITY
+     * ------------------------------------------------
+     *
+     * Keep the existing player ID behaviour.
+     */
     const playerId = getPlayerId();
+
+    /*
+     * Save the name in BOTH storages.
+     *
+     * sessionStorage:
+     * - survives navigation in this tab
+     * - prevents another tab/session from accidentally
+     *   replacing the current room identity
+     *
+     * localStorage:
+     * - survives refreshes
+     * - keeps compatibility with the existing RoomPage
+     */
+    sessionStorage.setItem(
+      "imposter_player_id",
+      playerId,
+    );
+
+    sessionStorage.setItem(
+      "imposter_player_name",
+      cleanName,
+    );
 
     localStorage.setItem(
       "imposter_player_name",
       cleanName,
     );
 
+    /*
+     * ------------------------------------------------
+     * ROOM SETTINGS
+     * ------------------------------------------------
+     *
+     * DO NOT change these values or defaults.
+     * The existing working selector values are preserved.
+     */
     localStorage.setItem(
       "imposter_room_settings",
       JSON.stringify({
@@ -102,11 +142,29 @@ export default function CreateGame() {
       }),
     );
 
+    /*
+     * ------------------------------------------------
+     * HOST FLAG
+     * ------------------------------------------------
+     *
+     * Store in both places for compatibility with
+     * different RoomPage versions.
+     */
+    sessionStorage.setItem(
+      "imposter_room_host",
+      "true",
+    );
+
     localStorage.setItem(
       "imposter_room_host",
       "true",
     );
 
+    /*
+     * ------------------------------------------------
+     * CREATE ROOM
+     * ------------------------------------------------
+     */
     const roomCode = generateRoomCode();
 
     router.push(`/room/${roomCode}`);
@@ -165,9 +223,17 @@ export default function CreateGame() {
       <section className="relative z-10 mx-auto flex w-full max-w-xl flex-col px-5 pb-16 pt-8 sm:px-8 sm:pt-12">
         {/* Heading */}
         <motion.div
-          initial={{ opacity: 0, y: 15 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.6 }}
+          initial={{
+            opacity: 0,
+            y: 15,
+          }}
+          animate={{
+            opacity: 1,
+            y: 0,
+          }}
+          transition={{
+            duration: 0.6,
+          }}
           className="mb-8"
         >
           <div className="mb-3 flex items-center gap-2 text-sm font-medium uppercase tracking-[0.25em] text-violet-300/60">
@@ -186,8 +252,14 @@ export default function CreateGame() {
         </motion.div>
 
         <motion.div
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
+          initial={{
+            opacity: 0,
+            y: 20,
+          }}
+          animate={{
+            opacity: 1,
+            y: 0,
+          }}
           transition={{
             delay: 0.1,
             duration: 0.6,
@@ -215,7 +287,9 @@ export default function CreateGame() {
             <input
               value={name}
               onChange={(event) =>
-                setName(event.target.value.slice(0, 20))
+                setName(
+                  event.target.value.slice(0, 20),
+                )
               }
               onKeyDown={(event) => {
                 if (
@@ -362,7 +436,9 @@ export default function CreateGame() {
           onClick={createRoom}
           className="mt-7 h-14 w-full rounded-2xl bg-white text-base font-semibold text-[#0b0b12] shadow-2xl shadow-white/5 transition-all hover:shadow-white/10 disabled:cursor-not-allowed disabled:opacity-40"
         >
-          {creating ? "Creating room..." : "Create Room"}
+          {creating
+            ? "Creating room..."
+            : "Create Room"}
         </motion.button>
       </section>
     </main>
