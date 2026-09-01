@@ -26,6 +26,7 @@ import { useParams, useRouter } from "next/navigation";
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
 } from "react";
@@ -58,6 +59,20 @@ type Clue = {
   playerId: string;
   playerName: string;
   clue: string;
+};
+
+type VoteDetail = {
+  voterId: string;
+  voterName: string;
+  targetId: string;
+  targetName: string;
+};
+
+type ScoreEntry = {
+  playerId: string;
+  playerName: string;
+  score: number;
+  roundPoints: number;
 };
 
 type RoomSettings = {
@@ -159,6 +174,10 @@ type ServerMessage =
         string,
         number
       >;
+      votes: VoteDetail[];
+      roundScores: Record<string, number>;
+      scores: Record<string, number>;
+      scoreboard: ScoreEntry[];
       eliminatedId: string | null;
       eliminatedName:
         | string
@@ -172,6 +191,8 @@ type ServerMessage =
         | "civilians"
         | "imposter";
       rounds: number;
+      scores: Record<string, number>;
+      scoreboard: ScoreEntry[];
     }
   | {
       type: "pong";
@@ -325,13 +346,13 @@ export default function RoomPage() {
       null,
     );
 
-  const chatNearBottomRef =
-    useRef(true);
+  // Chat scrolling is deliberately managed independently from the page.
+  // This avoids the mobile nested-flex/overflow bug where the chat body
+  // becomes part of the page scroll instead of being its own scroll surface.
+  const chatShouldStickRef = useRef(true);
+  const chatUnreadRef = useRef(0);
 
-  const chatAutoScrollFrameRef =
-    useRef<number | null>(null);
-
-  const [unreadChatCount, setUnreadChatCount] =
+  const [chatUnread, setChatUnread] =
     useState(0);
 
   const [playerId, setPlayerId] =
@@ -414,10 +435,74 @@ export default function RoomPage() {
       "civilians" | "imposter" | null
     >(null);
 
+  const [finalScoreboard, setFinalScoreboard] =
+    useState<ScoreEntry[]>([]);
+
   const isHost =
     hostPlayerId ===
       playerId &&
     playerId !== "";
+
+  // =====================================================
+  // CHAT SCROLLING
+  // =====================================================
+
+  const isChatNearBottom = useCallback(() => {
+    const container = chatScrollRef.current;
+    if (!container) return true;
+
+    return (
+      container.scrollHeight -
+        container.scrollTop -
+        container.clientHeight <= 48
+    );
+  }, []);
+
+  const scrollChatToBottom = useCallback(
+    (behavior: ScrollBehavior = "auto") => {
+      const container = chatScrollRef.current;
+      if (!container) return;
+
+      chatShouldStickRef.current = true;
+      chatUnreadRef.current = 0;
+      setChatUnread(0);
+
+      if (behavior === "smooth") {
+        container.scrollTo({
+          top: container.scrollHeight,
+          behavior,
+        });
+      } else {
+        container.scrollTop = container.scrollHeight;
+      }
+    },
+    [],
+  );
+
+  const handleChatScroll = useCallback(() => {
+    const atBottom = isChatNearBottom();
+
+    chatShouldStickRef.current = atBottom;
+
+    if (atBottom && chatUnreadRef.current > 0) {
+      chatUnreadRef.current = 0;
+      setChatUnread(0);
+    }
+  }, [isChatNearBottom]);
+
+  // Run after messages render so the browser has the new scrollHeight.
+  useLayoutEffect(() => {
+    if (!chatShouldStickRef.current) return;
+
+    const container = chatScrollRef.current;
+    if (!container) return;
+
+    const frame = requestAnimationFrame(() => {
+      container.scrollTop = container.scrollHeight;
+    });
+
+    return () => cancelAnimationFrame(frame);
+  }, [messages]);
 
   // =====================================================
   // CHAT SOUND
@@ -718,6 +803,8 @@ export default function RoomPage() {
               null,
             );
 
+            setFinalScoreboard([]);
+
             setClue("");
 
             setHasSubmittedClue(
@@ -793,7 +880,9 @@ export default function RoomPage() {
                   data.currentCluePlayerId,
                 clues:
                   data.phase === "clue"
-                    ? []
+                    ? current?.round === data.round
+                      ? current?.clues || []
+                      : []
                     : current?.clues || [],
               }),
             );
@@ -944,6 +1033,10 @@ export default function RoomPage() {
               data.winner,
             );
 
+            setFinalScoreboard(
+              data.scoreboard || [],
+            );
+
             setGame(
               (
                 current,
@@ -981,6 +1074,15 @@ export default function RoomPage() {
                   data.timestamp,
               };
 
+            const shouldAutoScroll =
+              chatShouldStickRef.current ||
+              isChatNearBottom();
+
+            if (!shouldAutoScroll) {
+              chatUnreadRef.current += 1;
+              setChatUnread(chatUnreadRef.current);
+            }
+
             setMessages(
               (current) => {
                 const next = [...current, newMessage];
@@ -990,12 +1092,11 @@ export default function RoomPage() {
               },
             );
 
-            if (data.playerId !== id) {
+            if (
+              data.playerId !==
+              id
+            ) {
               playChatSound();
-
-              if (!chatNearBottomRef.current) {
-                setUnreadChatCount((count) => count + 1);
-              }
             }
 
             return;
@@ -1061,6 +1162,7 @@ export default function RoomPage() {
     [
       code,
       playChatSound,
+      isChatNearBottom,
     ],
   );
 
@@ -1165,76 +1267,7 @@ export default function RoomPage() {
   }, [game]);
 
   // =====================================================
-  // CHAT SCROLL
-  // =====================================================
-
-  const updateChatScrollState = useCallback(() => {
-    const container = chatScrollRef.current;
-    if (!container) return;
-
-    const distanceFromBottom =
-      container.scrollHeight -
-      container.scrollTop -
-      container.clientHeight;
-
-    chatNearBottomRef.current = distanceFromBottom <= 72;
-
-    if (chatNearBottomRef.current) {
-      setUnreadChatCount(0);
-    }
-  }, []);
-
-  const scrollChatToBottom = useCallback((smooth = false) => {
-    const container = chatScrollRef.current;
-    if (!container) return;
-
-    if (chatAutoScrollFrameRef.current !== null) {
-      cancelAnimationFrame(chatAutoScrollFrameRef.current);
-    }
-
-    chatAutoScrollFrameRef.current = requestAnimationFrame(() => {
-      chatAutoScrollFrameRef.current = null;
-      const current = chatScrollRef.current;
-      if (!current) return;
-
-      current.scrollTo({
-        top: current.scrollHeight,
-        left: 0,
-        behavior: smooth ? "smooth" : "auto",
-      });
-    });
-  }, []);
-
-  useEffect(() => {
-    if (chatNearBottomRef.current) {
-      scrollChatToBottom(false);
-    }
-
-    return () => {
-      if (chatAutoScrollFrameRef.current !== null) {
-        cancelAnimationFrame(chatAutoScrollFrameRef.current);
-        chatAutoScrollFrameRef.current = null;
-      }
-    };
-  }, [messages, scrollChatToBottom]);
-
-  useEffect(() => {
-    const container = chatScrollRef.current;
-    if (!container || typeof ResizeObserver === "undefined") return;
-
-    const resizeObserver = new ResizeObserver(() => {
-      if (chatNearBottomRef.current) {
-        scrollChatToBottom(false);
-      }
-    });
-
-    resizeObserver.observe(container);
-    return () => resizeObserver.disconnect();
-  }, [scrollChatToBottom]);
-
-  // =====================================================
   // SEND CHAT
-
   // =====================================================
 
   const sendMessage = () => {
@@ -1306,6 +1339,10 @@ export default function RoomPage() {
     setStartingGame(true);
     setError("");
 
+    // Send the current UI selections with the start command as well.
+    // This makes PLAY atomic from the user's point of view: even if the
+    // settings_update packet is still in flight, the server starts with
+    // exactly what is currently selected in the UI.
     socketRef.current.send(
       JSON.stringify({
         type: "start_game",
@@ -1443,446 +1480,210 @@ export default function RoomPage() {
 
   if (!playerName) {
     return (
-      <main className="flex min-h-screen items-center justify-center bg-[#070611] px-5 text-white">
-        <div className="w-full max-w-md rounded-3xl border border-white/10 bg-white/[0.045] p-6 text-center backdrop-blur-xl">
-          <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-violet-400/10">
-            <Users className="h-6 w-6 text-violet-300" />
+      <main className="min-h-[100dvh] bg-[#dff3ff] px-5 py-8 text-[#20263d]">
+        <div className="mx-auto flex min-h-[calc(100dvh-4rem)] w-full max-w-md items-center">
+          <div className="w-full rounded-[34px] border-4 border-[#20263d] bg-white p-7 text-center shadow-[0_10px_0_#20263d]">
+            <div className="mx-auto flex h-20 w-20 items-center justify-center rounded-[26px] bg-[#ffd34d] text-4xl shadow-[0_7px_0_#20263d]">
+              🕵️
+            </div>
+            <h1 className="mt-7 text-4xl font-black tracking-tight">WHO ARE YOU?</h1>
+            <p className="mt-3 font-bold text-[#68718e]">Enter your name from the join screen before entering this room.</p>
+            <button onClick={() => router.push("/join")} className="mt-7 h-14 w-full rounded-full border-4 border-[#20263d] bg-[#20c4e8] text-lg font-black text-white shadow-[0_6px_0_#20263d] active:translate-y-1 active:shadow-[0_2px_0_#20263d]">GO TO JOIN</button>
           </div>
-
-          <h1 className="mt-5 text-2xl font-semibold">
-            Enter your name
-          </h1>
-
-          <p className="mt-2 text-sm leading-6 text-white/40">
-            Go back and enter
-            your player name
-            before joining this
-            room.
-          </p>
-
-          <motion.button
-            whileHover={{
-              y: -2,
-            }}
-            whileTap={{
-              scale: 0.98,
-            }}
-            onClick={() =>
-              router.push(
-                "/join",
-              )
-            }
-            className="mt-6 h-12 w-full rounded-2xl bg-white font-semibold text-[#070611]"
-          >
-            Go to Join Game
-          </motion.button>
         </div>
       </main>
     );
   }
 
-  // =====================================================
-  // MAIN UI
-  // =====================================================
+  const phaseTheme =
+    game?.phase === "voting"
+      ? { bg: "#ffd34d", accent: "#ff5f5f", title: "VOTE!", icon: "🗳️" }
+      : game?.phase === "discussion"
+        ? { bg: "#7bd13f", accent: "#20c4e8", title: "DISCUSSION!", icon: "💬" }
+        : game?.phase === "results"
+          ? { bg: "#b28cff", accent: "#ff5f5f", title: "RESULTS!", icon: "🏆" }
+          : { bg: "#20c4e8", accent: "#ff5f5f", title: "GIVE YOUR CLUE!", icon: "💡" };
+
+  // A clue timer belongs ONLY to the player whose clue turn is active.
+  // Other players see a waiting state instead of watching someone else's
+  // countdown, which also makes the UI match the server's per-player timer.
+  const clueTurnActive =
+    game?.phase === "clue" &&
+    isMyClueTurn;
+
+  const timerTotal =
+    game?.phase === "clue"
+      ? roomSettings.clueTime
+      : game?.phase === "discussion"
+        ? roomSettings.discussionTime
+        : game?.phase === "voting"
+          ? 30
+          : 8;
+
+  const timerVisible =
+    game?.phase !== "clue" ||
+    clueTurnActive;
+
+  const timerPercent =
+    timerVisible && timerTotal > 0
+      ? Math.max(
+          0,
+          Math.min(
+            100,
+            (timeLeft / timerTotal) * 100,
+          ),
+        )
+      : 0;
+
+  const playerColors = [
+    "bg-[#ff625f]",
+    "bg-[#20b6d5]",
+    "bg-[#7bd13f]",
+    "bg-[#ffb84d]",
+    "bg-[#a98af4]",
+    "bg-[#f276b9]",
+    "bg-[#38c6a7]",
+    "bg-[#ff8b45]",
+    "bg-[#5f9df7]",
+    "bg-[#d5c14a]",
+  ];
+
+  const renderPlayerCard = (player: Player, index: number, mode: "lobby" | "vote" = "lobby") => {
+    const isMe = player.id === playerId;
+    const host = player.id === hostPlayerId;
+    const selected = selectedVote === player.id;
+
+    if (mode === "vote") {
+      return (
+        <motion.button
+          key={player.id}
+          whileTap={!isMe && !hasSubmittedVote ? { scale: 0.98 } : undefined}
+          onClick={() => !isMe && !hasSubmittedVote && setSelectedVote(player.id)}
+          disabled={isMe || hasSubmittedVote}
+          className={`relative min-h-28 overflow-hidden rounded-[28px] border-4 border-[#20263d] p-5 text-left shadow-[0_7px_0_#20263d] transition ${playerColors[index % playerColors.length]} ${selected ? "ring-8 ring-white/80" : ""} ${isMe ? "opacity-35" : ""}`}
+        >
+          <div className="absolute right-4 top-4 flex h-11 w-11 items-center justify-center rounded-2xl border-3 border-[#20263d] bg-white/75 text-xl font-black text-[#20263d]">
+            {selected ? "✓" : index + 1}
+          </div>
+          <div className="pr-14 text-2xl font-black tracking-tight text-[#20263d]">{player.name}</div>
+          <div className="mt-2 text-xs font-black uppercase tracking-wider text-[#20263d]/60">{isMe ? "YOU CAN'T VOTE YOURSELF" : selected ? "YOUR VOTE" : "TAP TO VOTE"}</div>
+        </motion.button>
+      );
+    }
+
+    return (
+      <motion.div
+        key={player.id}
+        layout
+        initial={{ opacity: 0, y: 14, scale: 0.96 }}
+        animate={{ opacity: 1, y: 0, scale: 1 }}
+        exit={{ opacity: 0, y: -8, scale: 0.96 }}
+        className={`relative overflow-hidden rounded-[28px] border-4 border-[#20263d] p-5 shadow-[0_7px_0_#20263d] ${playerColors[index % playerColors.length]}`}
+      >
+        <div className="absolute -right-7 -top-7 h-24 w-24 rounded-full bg-white/20" />
+        <div className="relative flex items-center gap-4">
+          <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-[20px] border-4 border-[#20263d] bg-white/80 text-xl font-black text-[#20263d] shadow-[0_3px_0_#20263d]">
+            {player.name.slice(0, 1).toUpperCase()}
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="truncate text-xl font-black text-[#20263d]">{player.name}</span>
+              {isMe && <span className="rounded-full border-2 border-[#20263d] bg-white/80 px-2 py-0.5 text-[9px] font-black uppercase text-[#20263d]">YOU</span>}
+            </div>
+            <div className="mt-1 text-xs font-black uppercase tracking-wider text-[#20263d]/60">● ONLINE {host ? "• HOST 👑" : ""}</div>
+          </div>
+          <div className="hidden rounded-2xl border-3 border-[#20263d] bg-white/75 px-3 py-2 text-xs font-black text-[#20263d] sm:block">#{index + 1}</div>
+        </div>
+      </motion.div>
+    );
+  };
 
   return (
-    <main className="relative min-h-screen overflow-hidden bg-[#070611] text-white">
-      {/* Background */}
-
-      <div className="pointer-events-none fixed inset-0">
-        <motion.div
-          className="absolute -left-40 -top-40 h-[30rem] w-[30rem] rounded-full bg-violet-500/10 blur-3xl"
-          animate={{
-            x: [0, 70, 20, 0],
-            y: [0, 50, 90, 0],
-            scale: [
-              1,
-              1.08,
-              0.96,
-              1,
-            ],
-          }}
-          transition={{
-            duration: 20,
-            repeat:
-              Infinity,
-            ease:
-              "easeInOut",
-          }}
-        />
-
-        <motion.div
-          className="absolute -bottom-40 -right-40 h-[30rem] w-[30rem] rounded-full bg-indigo-500/10 blur-3xl"
-          animate={{
-            x: [0, -60, -20, 0],
-            y: [0, -40, -90, 0],
-            scale: [
-              1,
-              0.95,
-              1.06,
-              1,
-            ],
-          }}
-          transition={{
-            duration: 23,
-            repeat:
-              Infinity,
-            ease:
-              "easeInOut",
-          }}
-        />
-
-        <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,transparent_0%,#0b0b12_80%)]" />
+    <main className="relative min-h-[100dvh] overflow-x-hidden bg-[#dff3ff] text-[#20263d]">
+      {/* playful question-mark background */}
+      <div className="pointer-events-none fixed inset-0 overflow-hidden">
+        <div className="absolute -left-10 top-16 rotate-12 text-[150px] font-black leading-none text-[#cbe8f7]">?</div>
+        <div className="absolute right-[-25px] top-40 -rotate-12 text-[190px] font-black leading-none text-[#cbe8f7]">?</div>
+        <div className="absolute left-10 bottom-16 -rotate-6 text-[180px] font-black leading-none text-[#cbe8f7]">?</div>
+        <div className="absolute right-16 bottom-[-20px] rotate-12 text-[160px] font-black leading-none text-[#cbe8f7]">?</div>
       </div>
 
-      {/* =================================================
-          HEADER
-      ================================================= */}
+      <header className="relative z-20 border-b-4 border-[#20263d] bg-white/95 shadow-[0_5px_0_#20263d]">
+        <div className="mx-auto flex max-w-7xl items-center justify-between gap-3 px-4 py-4 sm:px-6">
+          <button onClick={() => router.push("/")} className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full border-4 border-[#20263d] bg-white text-2xl font-black shadow-[0_4px_0_#20263d] active:translate-y-1 active:shadow-none" aria-label="Leave room">
+            ←
+          </button>
 
-      <header className="relative z-10 border-b border-white/10 bg-[#070611]/60 backdrop-blur-2xl">
-        <div className="mx-auto flex max-w-7xl items-center justify-between px-4 py-4 sm:px-6">
-          <motion.button
-            whileHover={{
-              x: -2,
-            }}
-            whileTap={{
-              scale: 0.94,
-            }}
-            onClick={() =>
-              router.push(
-                "/",
-              )
-            }
-            className="flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-2 text-sm text-white/50 transition hover:bg-white/10 hover:text-white"
-          >
-            <ArrowLeft className="h-4 w-4" />
-
-            <span className="hidden sm:inline">
-              Leave
-            </span>
-          </motion.button>
-
-          <div className="flex flex-col items-center">
-            <span className="text-[10px] uppercase tracking-[0.3em] text-white/30">
-              Room
-            </span>
-
-            <motion.button
-              whileTap={{
-                scale: 0.96,
-              }}
-              onClick={
-                copyRoomCode
-              }
-              className="group mt-0.5 flex items-center gap-2"
-            >
-              <span className="text-lg font-semibold tracking-[0.2em]">
-                {code}
-              </span>
-
-              <AnimatePresence
-                mode="wait"
-              >
-                {copied ? (
-                  <motion.div
-                    key="check"
-                    initial={{
-                      opacity: 0,
-                      scale: 0.7,
-                    }}
-                    animate={{
-                      opacity: 1,
-                      scale: 1,
-                    }}
-                    exit={{
-                      opacity: 0,
-                      scale: 0.7,
-                    }}
-                  >
-                    <Check className="h-4 w-4 text-emerald-300" />
-                  </motion.div>
-                ) : (
-                  <Copy className="h-4 w-4 text-white/30 transition group-hover:text-white" />
-                )}
-              </AnimatePresence>
-            </motion.button>
+          <div className="min-w-0 text-center">
+            <div className="text-[10px] font-black uppercase tracking-[0.28em] text-[#73809f]">IMPOSTOR ROOM</div>
+            <button onClick={copyRoomCode} className="mt-0.5 flex items-center gap-2 text-xl font-black tracking-[0.18em] text-[#20263d]">
+              {code}
+              <span className="text-sm">{copied ? "✓" : "⧉"}</span>
+            </button>
           </div>
 
-          <div
-            className={`flex items-center gap-2 rounded-full border px-3 py-2 text-xs ${
-              connection ===
-              "connected"
-                ? "border-emerald-300/10 bg-emerald-300/5 text-emerald-200/70"
-                : connection ===
-                    "connecting"
-                  ? "border-amber-300/10 bg-amber-300/5 text-amber-200/70"
-                  : "border-red-300/10 bg-red-300/5 text-red-200/70"
-            }`}
-          >
-            {connection ===
-            "connected" ? (
-              <Wifi className="h-3.5 w-3.5" />
-            ) : (
-              <WifiOff className="h-3.5 w-3.5" />
-            )}
-
-            <span className="hidden sm:inline">
-              {connection ===
-              "connected"
-                ? "Connected"
-                : connection ===
-                    "connecting"
-                  ? "Connecting"
-                  : "Disconnected"}
-            </span>
-
-            {connection ===
-              "connected" && (
-              <span className="h-1.5 w-1.5 rounded-full bg-emerald-300" />
-            )}
+          <div className={`flex h-12 shrink-0 items-center gap-2 rounded-full border-4 border-[#20263d] px-3 text-xs font-black shadow-[0_4px_0_#20263d] ${connection === "connected" ? "bg-[#7bd13f]" : connection === "connecting" ? "bg-[#ffd34d]" : "bg-[#ff625f]"}`}>
+            <span>{connection === "connected" ? "●" : "!"}</span>
+            <span className="hidden sm:inline">{connection === "connected" ? "LIVE" : connection === "connecting" ? "CONNECTING" : "OFFLINE"}</span>
           </div>
         </div>
       </header>
 
-      {/* =================================================
-          CONTENT
-      ================================================= */}
-
-      <section className="relative z-10 mx-auto grid min-h-[calc(100vh-73px)] max-w-7xl gap-4 px-3 py-3 sm:gap-5 sm:px-6 sm:py-5 lg:grid-cols-[1fr_390px]">
-        {/* =================================================
-            LEFT
-        ================================================= */}
-
-        <div className="min-h-0 rounded-3xl border border-white/10 bg-white/[0.035] p-4 backdrop-blur-xl sm:min-h-[500px] sm:p-6">
-          {/* =================================================
-              LOBBY
-          ================================================= */}
-
-          {!game && (
-            <>
-              <div className="flex items-center justify-between">
-                <div>
-                  <div className="flex items-center gap-2">
-                    <Users className="h-5 w-5 text-violet-300" />
-
-                    <h1 className="text-xl font-semibold">
-                      Players
-                    </h1>
-                  </div>
-
-                  <p className="mt-1 text-sm text-white/35">
-                    Waiting for
-                    everyone to
-                    join
-                  </p>
-                </div>
-
-                <div className="rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-white/50">
-                  {players.length}/
-                  {
-                    roomSettings.players
-                  }
+      <section className="relative z-10 mx-auto grid min-h-0 min-h-[calc(100dvh-84px)] max-w-7xl gap-5 px-3 py-5 sm:px-6 lg:grid-cols-[minmax(0,1fr)_380px]">
+        <div className="min-w-0 min-h-0">
+          {!game ? (
+            <div className="space-y-5">
+              <div className="rounded-[36px] border-4 border-[#20263d] bg-[#303a70] p-6 text-center text-white shadow-[0_9px_0_#20263d] sm:p-9">
+                <div className="text-5xl">🕵️</div>
+                <h1 className="mt-3 text-5xl font-black tracking-tight sm:text-6xl">IMPOSTOR</h1>
+                <p className="mx-auto mt-3 max-w-2xl text-base font-bold leading-6 text-white/90 sm:text-lg">Give smart clues. Spot the liar. Make everyone suspicious.</p>
+                <div className="mx-auto mt-5 flex max-w-md items-center justify-center gap-2 rounded-full border-4 border-[#20263d] bg-white/15 px-4 py-3 font-black">
+                  <span className="text-[#ffd34d]">ROOM</span> {code} <span className="text-white/50">•</span> {players.length}/{roomSettings.players} PLAYERS
                 </div>
               </div>
 
-              {/* Error */}
-
               <AnimatePresence>
                 {error && (
-                  <motion.div
-                    initial={{
-                      opacity: 0,
-                      y: -5,
-                    }}
-                    animate={{
-                      opacity: 1,
-                      y: 0,
-                    }}
-                    exit={{
-                      opacity: 0,
-                      y: -5,
-                    }}
-                    className="mt-5 rounded-2xl border border-red-300/10 bg-red-300/5 p-4 text-sm text-red-200/70"
-                  >
+                  <motion.div initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -8 }} className="rounded-[24px] border-4 border-[#20263d] bg-[#ff625f] p-4 font-black shadow-[0_6px_0_#20263d]">
                     {error}
-
-                    {connection !==
-                      "connected" && (
-                      <button
-                        onClick={
-                          retryConnection
-                        }
-                        className="mt-3 rounded-xl bg-white/10 px-3 py-2 text-xs text-white"
-                      >
-                        Try again
-                      </button>
-                    )}
+                    {connection !== "connected" && <button onClick={retryConnection} className="ml-3 rounded-full border-3 border-[#20263d] bg-white px-4 py-2 text-xs font-black">TRY AGAIN</button>}
                   </motion.div>
                 )}
               </AnimatePresence>
 
-              {/* Players */}
-
-              <div className="mt-6 grid gap-3 sm:grid-cols-2">
-                <AnimatePresence mode="popLayout">
-                  {players.map(
-                    (
-                      player,
-                    ) => {
-                      const isMe =
-                        player.id ===
-                        playerId;
-
-                      const host =
-                        player.id ===
-                        hostPlayerId;
-
-                      return (
-                        <motion.div
-                          key={
-                            player.id
-                          }
-                          layout
-                          initial={{
-                            opacity: 0,
-                            scale: 0.94,
-                            y: 10,
-                          }}
-                          animate={{
-                            opacity: 1,
-                            scale: 1,
-                            y: 0,
-                          }}
-                          exit={{
-                            opacity: 0,
-                            scale: 0.94,
-                            y: -10,
-                          }}
-                          className={`relative overflow-hidden rounded-2xl border p-4 ${
-                            isMe
-                              ? "border-violet-300/20 bg-violet-400/[0.08]"
-                              : "border-white/10 bg-white/[0.025]"
-                          }`}
-                        >
-                          <div className="relative flex items-center gap-3">
-                            <div
-                              className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-gradient-to-br text-sm font-semibold ${getAvatarStyle(
-                                player.name,
-                              )}`}
-                            >
-                              {player.name
-                                .slice(
-                                  0,
-                                  1,
-                                )
-                                .toUpperCase()}
-                            </div>
-
-                            <div className="min-w-0 flex-1">
-                              <div className="flex items-center gap-2">
-                                <span className="truncate font-medium">
-                                  {
-                                    player.name
-                                  }
-                                </span>
-
-                                {isMe && (
-                                  <span className="rounded-full bg-white/10 px-2 py-0.5 text-[9px] uppercase tracking-wider text-white/40">
-                                    You
-                                  </span>
-                                )}
-                              </div>
-
-                              <div className="mt-1 flex items-center gap-1.5 text-xs text-white/30">
-                                <Circle className="h-2 w-2 fill-emerald-300 text-emerald-300" />
-                                Online
-                              </div>
-                            </div>
-
-                            {host && (
-                              <div className="flex items-center gap-1.5 rounded-full bg-amber-300/10 px-2 py-1">
-                                <Crown className="h-3.5 w-3.5 text-amber-200/80" />
-
-                                <span className="hidden text-[10px] uppercase tracking-wider text-amber-200/70 sm:inline">
-                                  Host
-                                </span>
-                              </div>
-                            )}
-                          </div>
-                        </motion.div>
-                      );
-                    },
-                  )}
-                </AnimatePresence>
-              </div>
-
-              {/* Settings */}
-
-              <div className="mt-6 overflow-hidden rounded-3xl border border-fuchsia-400/10 bg-gradient-to-br from-fuchsia-500/[0.07] via-violet-500/[0.04] to-cyan-400/[0.05] p-4 shadow-2xl shadow-violet-950/10">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="flex items-center gap-2">
-                    <div className="rounded-xl bg-fuchsia-400/10 p-2">
-                      <SlidersHorizontal className="h-4 w-4 text-fuchsia-300" />
-                    </div>
-                    <div>
-                      <span className="text-xs font-semibold uppercase tracking-[0.18em] text-white/45">
-                        Game settings
-                      </span>
-                      <p className="mt-0.5 text-[11px] text-white/25">
-                        {isHost ? "Tune the chaos before you start" : "Set by the host"}
-                      </p>
-                    </div>
+              <div className="rounded-[32px] border-4 border-[#20263d] bg-white p-5 shadow-[0_8px_0_#20263d] sm:p-6">
+                <div className="flex items-end justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-black uppercase tracking-[0.2em] text-[#7b86a5]">PLAYERS</div>
+                    <h2 className="mt-1 text-3xl font-black">Who is in? 👀</h2>
                   </div>
-
-                  {isHost && (
-                    <span className="flex items-center gap-1.5 rounded-full border border-amber-300/10 bg-amber-300/5 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider text-amber-200/70">
-                      <Crown className="h-3 w-3" />
-                      Host
-                    </span>
-                  )}
+                  <div className="rounded-full border-3 border-[#20263d] bg-[#ffd34d] px-4 py-2 text-sm font-black shadow-[0_3px_0_#20263d]">{players.length} / {roomSettings.players}</div>
                 </div>
 
+                <div className="mt-5 grid gap-3 sm:grid-cols-2">
+                  <AnimatePresence mode="popLayout">
+                    {players.map((player, index) => renderPlayerCard(player, index))}
+                  </AnimatePresence>
+                </div>
+              </div>
+
+              <div className="rounded-[32px] border-4 border-[#20263d] bg-[#303a70] p-5 text-white shadow-[0_8px_0_#20263d] sm:p-6">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="text-xs font-black uppercase tracking-[0.2em] text-white/60">GAME SETTINGS</div>
+                    <h2 className="mt-1 text-2xl font-black">Set the chaos</h2>
+                  </div>
+                  {isHost && <span className="rounded-full border-3 border-[#20263d] bg-[#ffd34d] px-3 py-1 text-xs font-black text-[#20263d]">👑 HOST</span>}
+                </div>
                 {isHost ? (
-                  <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-                    <SettingSelect
-                      label="Players"
-                      value={roomSettings.players}
-                      options={[2, 3, 4, 5, 6, 7, 8, 9, 10]}
-                      suffix=" players"
-                      onChange={(value) =>
-                        updateRoomSetting({ players: value })
-                      }
-                    />
-                    <SettingSelect
-                      label="Rounds"
-                      value={roomSettings.rounds}
-                      options={[3, 5, 7, 10]}
-                      suffix=" rounds"
-                      onChange={(value) =>
-                        updateRoomSetting({ rounds: value })
-                      }
-                    />
-                    <SettingSelect
-                      label="Clue time"
-                      value={roomSettings.clueTime}
-                      options={[15, 30, 45, 60]}
-                      suffix=" sec"
-                      onChange={(value) =>
-                        updateRoomSetting({ clueTime: value })
-                      }
-                    />
-                    <SettingSelect
-                      label="Discussion"
-                      value={roomSettings.discussionTime}
-                      options={[30, 45, 60, 90]}
-                      suffix=" sec"
-                      onChange={(value) =>
-                        updateRoomSetting({ discussionTime: value })
-                      }
-                    />
+                  <div className="mt-5 grid gap-3 sm:grid-cols-4">
+                    <SettingSelect label="Players" value={roomSettings.players} options={[2,3,4,5,6,7,8,9,10]} suffix=" players" onChange={(value) => updateRoomSetting({ players: value })} />
+                    <SettingSelect label="Rounds" value={roomSettings.rounds} options={[1,3,5,7,10]} suffix=" rounds" onChange={(value) => updateRoomSetting({ rounds: value })} />
+                    <SettingSelect label="Clue" value={roomSettings.clueTime} options={[15,30,45,60]} suffix=" sec" onChange={(value) => updateRoomSetting({ clueTime: value })} />
+                    <SettingSelect label="Discussion" value={roomSettings.discussionTime} options={[30,45,60,90]} suffix=" sec" onChange={(value) => updateRoomSetting({ discussionTime: value })} />
                   </div>
                 ) : (
-                  <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
+                  <div className="mt-5 grid grid-cols-3 gap-2 sm:grid-cols-4">
                     <SettingPill label="Players" value={roomSettings.players} />
                     <SettingPill label="Rounds" value={roomSettings.rounds} />
                     <SettingPill label="Clue" value={`${roomSettings.clueTime}s`} />
@@ -1891,830 +1692,352 @@ export default function RoomPage() {
                 )}
               </div>
 
-              {/* START */}
-
               {isHost && (
-                <motion.button
-                  whileHover={{
-                    y: -2,
-                  }}
-                  whileTap={{
-                    scale: 0.98,
-                  }}
-                  onClick={
-                    startGame
-                  }
-                  disabled={
-                    players.length < 2 ||
-                    players.length > roomSettings.players ||
-                    startingGame
-                  }
-                  className="mt-6 flex h-16 w-full items-center justify-center gap-3 rounded-2xl bg-gradient-to-r from-fuchsia-500 via-violet-500 to-indigo-500 font-semibold text-white shadow-xl shadow-violet-500/20 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-30"
-                >
-                  <Play className="h-5 w-5 fill-current" />
-
-                  Start Game
+                <motion.button whileTap={{ scale: 0.98, y: 3 }} onClick={startGame} disabled={players.length < 2 || startingGame} className="flex h-20 w-full items-center justify-center gap-3 rounded-full border-4 border-[#20263d] bg-[#20c4e8] text-2xl font-black text-white shadow-[0_8px_0_#20263d] disabled:cursor-not-allowed disabled:opacity-40">
+                  {startingGame ? "STARTING..." : <>PLAY GAME <span className="text-3xl">▶</span></>}
                 </motion.button>
               )}
 
               {!isHost && (
-                <div className="mt-6 rounded-2xl border border-white/5 bg-white/[0.02] p-5 text-center">
-                  <Crown className="mx-auto h-5 w-5 text-amber-200/50" />
-
-                  <p className="mt-2 text-sm text-white/40">
-                    Waiting for the
-                    host to start
-                    the game...
-                  </p>
+                <div className="rounded-[28px] border-4 border-[#20263d] bg-white p-5 text-center font-black shadow-[0_7px_0_#20263d]">
+                  <div className="text-3xl">👑</div>
+                  <p className="mt-2 text-lg">Waiting for the host to start...</p>
                 </div>
               )}
-            </>
-          )}
-
-          {/* =================================================
-              GAME
-          ================================================= */}
-
-          {game && (
-            <div>
-              {/* Game Header */}
-
-              <div className="flex items-start justify-between gap-4">
-                <div>
-                  <div className="flex items-center gap-2">
-                    <Lightbulb className="h-5 w-5 text-violet-300" />
-
-                    <h1 className="text-xl font-semibold">
-                      {game.status ===
-                      "finished"
-                        ? "Game Over"
-                        : phaseLabel(
-                            game.phase,
-                          )}
-                    </h1>
+            </div>
+          ) : (
+            <div className="space-y-5">
+              {/* GAME HERO */}
+              <div className="overflow-hidden rounded-[36px] border-4 border-[#20263d] shadow-[0_9px_0_#20263d]" style={{ backgroundColor: phaseTheme.bg }}>
+                <div className="relative p-6 sm:p-8">
+                  <div className="absolute right-5 top-5 text-6xl opacity-20">{phaseTheme.icon}</div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="rounded-full border-3 border-[#20263d] bg-white px-4 py-2 text-xs font-black shadow-[0_3px_0_#20263d]">ROUND {game.round} / {game.totalRounds}</span>
+                    {role && <span className={`rounded-full border-3 border-[#20263d] px-4 py-2 text-xs font-black shadow-[0_3px_0_#20263d] ${role === "imposter" ? "bg-[#ff625f]" : "bg-[#7bd13f]"}`}>{role === "imposter" ? "😈 IMPOSTOR" : "😇 CIVILIAN"}</span>}
                   </div>
+                  <h1 className="mt-5 max-w-2xl text-5xl font-black uppercase leading-[0.95] tracking-tight sm:text-7xl">{game.status === "finished" ? "GAME OVER" : phaseTheme.title}</h1>
+                  <p className="mt-3 max-w-2xl text-base font-black text-[#20263d]/75 sm:text-lg">{game.status === "finished" ? "The chaos is complete." : phaseDescription(game.phase)}</p>
 
-                  <p className="mt-1 text-sm text-white/35">
-                    {game.status ===
-                    "finished"
-                      ? "Thanks for playing."
-                      : phaseDescription(
-                          game.phase,
-                        )}
-                  </p>
-                </div>
-
-                <div className="shrink-0 rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-white/50">
-                  Round{" "}
-                  {game.round}/
-                  {
-                    game.totalRounds
-                  }
+                  {game.status === "playing" && game.phase !== "results" && (
+                    <div className="mt-6">
+                      {game.phase === "clue" && !clueTurnActive ? (
+                        <div className="flex items-center gap-4 rounded-[26px] border-4 border-[#20263d] bg-white/85 p-4 shadow-[0_5px_0_#20263d]">
+                          <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded-full border-4 border-[#20263d] bg-[#ffd34d] text-3xl">⏳</div>
+                          <div>
+                            <div className="text-xs font-black uppercase tracking-[0.18em] text-[#7b86a5]">WAIT YOUR TURN</div>
+                            <div className="mt-1 text-xl font-black">{currentCluePlayer ? `${currentCluePlayer.name} is giving a clue` : "Another player is giving a clue"}</div>
+                            <div className="mt-1 text-sm font-bold text-[#68718e]">Your {roomSettings.clueTime}s timer starts when your turn begins.</div>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="flex flex-wrap items-center gap-4">
+                          <div className="flex h-24 w-24 flex-col items-center justify-center rounded-full border-4 border-[#20263d] bg-white shadow-[0_6px_0_#20263d]">
+                            <span className="text-3xl font-black leading-none">{timeLeft}</span>
+                            <span className="mt-1 text-[9px] font-black uppercase">{game.phase === "clue" ? "your seconds" : "seconds"}</span>
+                          </div>
+                          <div className="min-w-[180px] flex-1">
+                            <div className="mb-2 flex justify-between text-xs font-black uppercase"><span>{game.phase === "clue" ? "YOUR TIME" : "TIME"}</span><span>{timeLeft}s left</span></div>
+                            <div className="h-5 overflow-hidden rounded-full border-3 border-[#20263d] bg-white/70">
+                              <motion.div animate={{ width: `${timerPercent}%` }} transition={{ duration: 0.2 }} className="h-full rounded-full bg-[#ff625f]" />
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
 
-              {/* Phase rail */}
-
-              {game.status === "playing" && (
-                <div className="mt-5 grid grid-cols-4 gap-1.5">
-                  {(["clue", "discussion", "voting", "results"] as GamePhase[]).map((phase) => {
-                    const active = game.phase === phase;
-                    const phaseOrder = ["clue", "discussion", "voting", "results"];
-                    const currentIndex = phaseOrder.indexOf(game.phase);
-                    const phaseIndex = phaseOrder.indexOf(phase);
-                    const complete = phaseIndex < currentIndex;
-                    return (
-                      <div
-                        key={phase}
-                        className={`h-1.5 rounded-full transition-all duration-300 ${
-                          active
-                            ? "bg-gradient-to-r from-fuchsia-400 via-violet-400 to-cyan-300 shadow-lg shadow-violet-500/30"
-                            : complete
-                              ? "bg-violet-400/50"
-                              : "bg-white/10"
-                        }`}
-                      />
-                    );
-                  })}
-                </div>
-              )}
-
-              {/* Timer */}
-
-              {game.status ===
-                "playing" &&
-                game.phase !==
-                  "results" && (
-                  <div className="mt-6 flex items-center justify-center">
-                    <div className={`flex items-center gap-3 rounded-2xl border px-6 py-3 shadow-xl ${
-                        timeLeft <= 5
-                          ? "border-rose-400/30 bg-rose-500/10 shadow-rose-500/10"
-                          : "border-violet-300/15 bg-gradient-to-r from-fuchsia-500/[0.08] via-violet-500/[0.08] to-cyan-400/[0.06] shadow-violet-500/10"
-                      }`}>
-                      <Clock className={`h-4 w-4 ${timeLeft <= 5 ? "text-rose-300" : "text-violet-300"}`} />
-
-                      <span className={`text-2xl font-bold tabular-nums ${timeLeft <= 5 ? "text-rose-200" : "text-white"}`}>
-                        {timeLeft}s
-                      </span>
+              {/* PRIVATE ROLE */}
+              {role && (
+                <div className={`rounded-[32px] border-4 border-[#20263d] p-6 shadow-[0_8px_0_#20263d] ${role === "imposter" ? "bg-[#ff625f]" : "bg-[#7bd13f]"}`}>
+                  <div className="flex items-center justify-between gap-4">
+                    <div>
+                      <div className="text-xs font-black uppercase tracking-[0.2em] text-[#20263d]/60">YOUR SECRET ROLE</div>
+                      <h2 className="mt-1 text-3xl font-black">{role === "imposter" ? "YOU ARE THE IMPOSTOR 😈" : "YOU ARE A CIVILIAN 😇"}</h2>
                     </div>
+                    <div className="text-5xl">{role === "imposter" ? "🕵️" : "🔎"}</div>
                   </div>
-                )}
-
-              {/* =================================================
-                  PRIVATE ROLE CARD
-              ================================================= */}
-
-              {game.status ===
-                "playing" &&
-                role && (
-                  <motion.div
-                    initial={{
-                      opacity: 0,
-                      y: 10,
-                    }}
-                    animate={{
-                      opacity: 1,
-                      y: 0,
-                    }}
-                    className={`mt-6 rounded-3xl border p-6 text-center ${
-                      role ===
-                      "imposter"
-                        ? "border-red-300/15 bg-red-400/[0.06]"
-                        : "border-emerald-300/15 bg-emerald-400/[0.05]"
-                    }`}
-                  >
-                    <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-white/5">
-                      {role ===
-                      "imposter" ? (
-                        <EyeOff className="h-7 w-7 text-red-200/80" />
-                      ) : (
-                        <Eye className="h-7 w-7 text-emerald-200/80" />
-                      )}
-                    </div>
-
-                    <p className="mt-4 text-xs uppercase tracking-[0.2em] text-white/30">
-                      Your role
-                    </p>
-
-                    <h2
-                      className={`mt-1 text-2xl font-bold ${
-                        role ===
-                        "imposter"
-                          ? "text-red-200"
-                          : "text-emerald-200"
-                      }`}
-                    >
-                      {role ===
-                      "imposter"
-                        ? "IMPOSTER"
-                        : "CIVILIAN"}
-                    </h2>
-
-                    {role ===
-                    "civilian" ? (
-                      <>
-                        <p className="mt-4 text-xs uppercase tracking-wider text-white/25">
-                          Secret word
-                        </p>
-
-                        <p className="mt-1 text-3xl font-semibold">
-                          {word}
-                        </p>
-
-                        <p className="mt-3 text-xs text-white/30">
-                          Keep the word
-                          secret.
-                        </p>
-                      </>
-                    ) : (
-                      <p className="mx-auto mt-4 max-w-sm text-sm leading-6 text-red-100/50">
-                        You don't know
-                        the word.
-                        Blend in, listen
-                        carefully, and
-                        convince everyone
-                        you're innocent.
-                      </p>
-                    )}
-                  </motion.div>
-                )}
-
-              {/* =================================================
-                  CLUE PHASE
-              ================================================= */}
-
-              {game.status ===
-                "playing" &&
-                game.phase ===
-                  "clue" && (
-                  <div className="mt-5 overflow-hidden rounded-3xl border border-fuchsia-400/15 bg-gradient-to-br from-fuchsia-500/[0.11] via-violet-500/[0.05] to-cyan-400/[0.06] p-5 shadow-2xl shadow-violet-950/15">
-                    <div className="flex items-center justify-between gap-3">
-                      <div>
-                        <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-violet-200/50">
-                          Clue turn
-                        </p>
-                        <p className="mt-1 text-lg font-bold">
-                          {isMyClueTurn
-                            ? "Your turn! 🎯"
-                            : currentCluePlayer
-                              ? `${currentCluePlayer.name}'s turn`
-                              : "Waiting for the next player"}
-                        </p>
-                      </div>
-                      <div className="rounded-2xl bg-white/10 px-3 py-2 text-center">
-                        <div className="text-[9px] uppercase tracking-wider text-white/30">
-                          Clues
-                        </div>
-                        <div className="text-sm font-bold text-white/80">
-                          {game.clues.length}/{players.length}
-                        </div>
-                      </div>
-                    </div>
-
-                    <p className="mt-2 text-xs leading-5 text-white/35">
-                      {isMyClueTurn
-                        ? "Give a subtle clue. Everyone is watching 👀"
-                        : currentCluePlayer
-                          ? `Watch ${currentCluePlayer.name}. You'll get a turn after them.`
-                          : "The next turn will appear here."}
-                    </p>
-
-                    <div className="mt-4 flex gap-2">
-                      <input
-                        value={clue}
-                        onChange={(
-                          event,
-                        ) =>
-                          setClue(
-                            event.target.value.slice(
-                              0,
-                              100,
-                            ),
-                          )
-                        }
-                        onKeyDown={(
-                          event,
-                        ) => {
-                          if (
-                            event.key ===
-                            "Enter"
-                          ) {
-                            submitClue();
-                          }
-                        }}
-                        disabled={
-                          hasSubmittedClue ||
-                          !isMyClueTurn
-                        }
-                        placeholder={
-                          isMyClueTurn
-                            ? "Give a subtle clue..."
-                            : "Wait for your turn..."
-                        }
-                        className="min-w-0 flex-1 rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3 text-sm outline-none placeholder:text-white/20 focus:border-violet-300/20 disabled:opacity-40"
-                      />
-
-                      <motion.button
-                        whileTap={{
-                          scale: 0.94,
-                        }}
-                        onClick={
-                          submitClue
-                        }
-                        disabled={
-                          !clue.trim() ||
-                          hasSubmittedClue ||
-                          !isMyClueTurn
-                        }
-                        className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-white text-[#070611] disabled:opacity-20"
-                      >
-                        <Send className="h-4 w-4" />
-                      </motion.button>
-                    </div>
-
-                    {hasSubmittedClue && (
-                      <p className="mt-3 text-xs font-medium text-emerald-300/70">
-                        ✓ Clue submitted — watch the others!
-                      </p>
-                    )}
-                  </div>
-                )}
-
-              {/* =================================================
-                  CLUES
-              ================================================= */}
-
-              {game.clues.length >
-                0 && (
-                <div className="mt-5">
-                  <p className="text-xs uppercase tracking-[0.18em] text-white/25">
-                    Clues
-                  </p>
-
-                  <div className="mt-3 space-y-2">
-                    {game.clues.map(
-                      (
-                        item,
-                        index,
-                      ) => (
-                        <motion.div
-                          key={
-                            item.playerId
-                          }
-                          initial={{
-                            opacity: 0,
-                            x: -8,
-                          }}
-                          animate={{
-                            opacity: 1,
-                            x: 0,
-                          }}
-                          className="flex items-center gap-3 rounded-2xl border border-white/5 bg-white/[0.025] px-4 py-3"
-                        >
-                          <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-white/5 text-[10px] font-bold text-white/35">
-                            {index + 1}
-                          </span>
-
-                          <span className="min-w-0 flex-1 text-sm font-medium text-violet-200/70">
-                            {item.playerName}
-                          </span>
-
-                          <span className="text-right text-sm text-white/60">
-                            {item.clue}
-                          </span>
-                        </motion.div>
-                      ),
-                    )}
+                  <div className="mt-5 rounded-[24px] border-4 border-[#20263d] bg-white p-5 text-center shadow-[0_5px_0_#20263d]">
+                    <div className="text-xs font-black uppercase tracking-[0.2em] text-[#7b86a5]">{role === "imposter" ? "YOUR MISSION" : "SECRET WORD"}</div>
+                    <div className="mt-2 text-3xl font-black text-[#20263d] sm:text-4xl">{role === "imposter" ? "BLEND IN. SURVIVE." : word || "Waiting..."}</div>
                   </div>
                 </div>
               )}
 
-              {/* =================================================
-                  DISCUSSION
-              ================================================= */}
-
-              {game.status ===
-                "playing" &&
-                game.phase ===
-                  "discussion" && (
-                  <div className="mt-5 rounded-2xl border border-violet-300/10 bg-violet-400/[0.04] p-5 text-center">
-                    <MessageCircle className="mx-auto h-6 w-6 text-violet-300/70" />
-
-                    <p className="mt-3 text-sm text-white/60">
-                      Discussion is
-                      open.
-                    </p>
-
-                    <p className="mt-1 text-xs text-white/30">
-                      Use the lobby
-                      chat to accuse,
-                      defend and
-                      investigate.
-                    </p>
-                  </div>
-                )}
-
-              {/* =================================================
-                  VOTING
-              ================================================= */}
-
-              {game.status ===
-                "playing" &&
-                game.phase ===
-                  "voting" && (
-                  <div className="mt-5 rounded-2xl border border-white/10 bg-black/10 p-5">
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <p className="text-xs uppercase tracking-[0.18em] text-white/25">
-                          Vote
-                        </p>
-
-                        <p className="mt-1 text-sm text-white/40">
-                          Who is the
-                          imposter?
-                        </p>
-                      </div>
-
-                      <div className="flex items-center gap-2 text-xs text-white/30">
-                        <Vote className="h-4 w-4" />
-
-                        {
-                          votesSubmitted
-                        }
-                        /
-                        {
-                          players.length
-                        }
-                      </div>
+              {/* CLUE PHASE */}
+              {game.phase === "clue" && (
+                <div className="rounded-[32px] border-4 border-[#20263d] bg-white p-5 shadow-[0_8px_0_#20263d] sm:p-7">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <div className="text-xs font-black uppercase tracking-[0.2em] text-[#7b86a5]">CLUE TURN</div>
+                      <h2 className="mt-1 text-3xl font-black">{currentCluePlayer ? `${currentCluePlayer.name}'s turn` : "Next player"}</h2>
                     </div>
-
-                    <div className="mt-4 grid gap-2 sm:grid-cols-2">
-                      {players.map(
-                        (
-                          player,
-                        ) => {
-                          const selected =
-                            selectedVote ===
-                            player.id;
-
-                          const isMe =
-                            player.id ===
-                            playerId;
-
-                          return (
-                            <button
-                              key={
-                                player.id
-                              }
-                              onClick={() =>
-                                !isMe &&
-                                !hasSubmittedVote &&
-                                setSelectedVote(player.id)
-                              }
-                              disabled={
-                                isMe || hasSubmittedVote
-                              }
-                              className={`flex items-center gap-3 rounded-xl border p-3 text-left transition ${
-                                isMe
-                                  ? "cursor-not-allowed border-white/5 bg-white/[0.015] opacity-30"
-                                  : selected
-                                    ? "border-violet-300/30 bg-violet-400/10"
-                                    : "border-white/10 bg-white/[0.025] hover:bg-white/[0.05]"
-                              }`}
-                            >
-                              <div
-                                className={`flex h-9 w-9 items-center justify-center rounded-full bg-gradient-to-br text-xs font-semibold ${getAvatarStyle(
-                                  player.name,
-                                )}`}
-                              >
-                                {player.name
-                                  .slice(
-                                    0,
-                                    1,
-                                  )
-                                  .toUpperCase()}
-                              </div>
-
-                              <span className="min-w-0 flex-1 truncate text-sm">
-                                {
-                                  player.name
-                                }
-                              </span>
-
-                              {selected && (
-                                <Check className="h-4 w-4 text-violet-300" />
-                              )}
-                            </button>
-                          );
-                        },
-                      )}
-                    </div>
-
-                    <motion.button
-                      whileTap={{
-                        scale: 0.98,
-                      }}
-                      onClick={
-                        submitVote
-                      }
-                      disabled={
-                        !selectedVote ||
-                        hasSubmittedVote
-                      }
-                      className={`mt-4 h-12 w-full rounded-xl font-semibold transition ${
-                        hasSubmittedVote
-                          ? "bg-emerald-300/15 text-emerald-200"
-                          : "bg-white text-[#070611] disabled:opacity-20"
-                      }`}
-                    >
-                      {hasSubmittedVote ? (
-                        <span className="flex items-center justify-center gap-2">
-                          <Check className="h-4 w-4" />
-                          Vote Submitted
-                        </span>
-                      ) : (
-                        "Submit Vote"
-                      )}
-                    </motion.button>
+                    <div className="rounded-2xl border-4 border-[#20263d] bg-[#ffd34d] px-4 py-3 text-center shadow-[0_4px_0_#20263d]"><div className="text-2xl font-black">{game.clues.length}</div><div className="text-[9px] font-black uppercase">clues</div></div>
                   </div>
-                )}
+                  <p className="mt-3 font-bold text-[#68718e]">{isMyClueTurn ? "Your turn! Give a clever clue without making the word obvious." : currentCluePlayer ? `Watch ${currentCluePlayer.name}. Your turn is coming.` : "Get ready."}</p>
+                  <div className="mt-5 flex flex-col gap-3 sm:flex-row">
+                    <input value={clue} onChange={(event) => setClue(event.target.value.slice(0, 100))} onKeyDown={(event) => event.key === "Enter" && submitClue()} disabled={hasSubmittedClue || !isMyClueTurn} placeholder={isMyClueTurn ? "Type your clue..." : `Waiting for ${currentCluePlayer?.name || "the next player"}...`} className="h-14 min-w-0 flex-1 rounded-2xl border-4 border-[#20263d] bg-[#eef9ff] px-4 text-base font-bold text-[#20263d] outline-none placeholder:text-[#8c97b1] focus:bg-white disabled:opacity-50" />
+                    <button onClick={submitClue} disabled={!clue.trim() || hasSubmittedClue || !isMyClueTurn} className="h-14 rounded-full border-4 border-[#20263d] bg-[#20c4e8] px-8 text-lg font-black text-white shadow-[0_5px_0_#20263d] disabled:opacity-30">{hasSubmittedClue ? "SENT ✓" : "SEND CLUE"}</button>
+                  </div>
+                </div>
+              )}
 
-              {/* =================================================
-                  RESULTS
-              ================================================= */}
+              {/* CLUE HISTORY */}
+              {game.clues.length > 0 && (
+                <div className="rounded-[32px] border-4 border-[#20263d] bg-[#303a70] p-5 text-white shadow-[0_8px_0_#20263d] sm:p-7">
+                  <div className="flex items-center justify-between"><h2 className="text-2xl font-black">CLUE BOARD 🧠</h2><span className="rounded-full border-3 border-[#20263d] bg-white px-3 py-1 text-xs font-black text-[#20263d]">{game.clues.length} / {players.length}</span></div>
+                  <div className="mt-5 grid gap-3 sm:grid-cols-2">
+                    {game.clues.map((item, index) => (
+                      <motion.div key={item.playerId} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className={`rounded-[24px] border-4 border-[#20263d] p-4 text-[#20263d] shadow-[0_5px_0_#20263d] ${playerColors[index % playerColors.length]}`}>
+                        <div className="flex items-center justify-between gap-2"><span className="font-black">{item.playerName}</span><span className="rounded-full border-2 border-[#20263d] bg-white/75 px-2 py-0.5 text-[9px] font-black">#{index + 1}</span></div>
+                        <div className="mt-3 rounded-2xl border-3 border-[#20263d] bg-white/80 p-3 text-lg font-black">“{item.clue}”</div>
+                      </motion.div>
+                    ))}
+                  </div>
+                </div>
+              )}
 
+              {/* DISCUSSION */}
+              {game.phase === "discussion" && (
+                <div className="rounded-[32px] border-4 border-[#20263d] bg-[#7bd13f] p-6 text-center shadow-[0_8px_0_#20263d] sm:p-9">
+                  <div className="text-6xl">💬</div>
+                  <h2 className="mt-2 text-5xl font-black uppercase">DISCUSS!</h2>
+                  <p className="mx-auto mt-3 max-w-xl text-lg font-black text-[#20263d]/75">Accuse. Defend. Lie. Figure out who has no idea what the secret word is.</p>
+                  <div className="mx-auto mt-6 max-w-xl rounded-[24px] border-4 border-[#20263d] bg-white p-4 text-xl font-black shadow-[0_5px_0_#20263d]">🔥 Use the chat — this is where the chaos happens.</div>
+                </div>
+              )}
+
+              {/* VOTING */}
+              {game.phase === "voting" && (
+                <div className="rounded-[32px] border-4 border-[#20263d] bg-white p-5 shadow-[0_8px_0_#20263d] sm:p-7">
+                  <div className="flex items-end justify-between gap-3"><div><div className="text-xs font-black uppercase tracking-[0.2em] text-[#7b86a5]">FINAL CALL</div><h2 className="mt-1 text-4xl font-black">WHO IS SUS? 🧐</h2></div><div className="rounded-full border-3 border-[#20263d] bg-[#ffd34d] px-4 py-2 text-sm font-black shadow-[0_3px_0_#20263d]">{votesSubmitted}/{players.length} VOTED</div></div>
+                  <p className="mt-3 font-bold text-[#68718e]">Pick one player. You cannot vote yourself.</p>
+                  <div className="mt-5 grid gap-3 sm:grid-cols-2">{players.map((player, index) => renderPlayerCard(player, index, "vote"))}</div>
+                  <button onClick={submitVote} disabled={!selectedVote || hasSubmittedVote} className={`mt-5 h-16 w-full rounded-full border-4 border-[#20263d] text-xl font-black shadow-[0_6px_0_#20263d] disabled:opacity-40 ${hasSubmittedVote ? "bg-[#7bd13f]" : "bg-[#ff625f]"}`}>{hasSubmittedVote ? "VOTE LOCKED ✓" : "CAST MY VOTE"}</button>
+                </div>
+              )}
+
+              {/* ROUND RESULTS */}
               {roundResult && (
                 <motion.div
-                  initial={{
-                    opacity: 0,
-                    scale: 0.97,
-                  }}
-                  animate={{
-                    opacity: 1,
-                    scale: 1,
-                  }}
-                  className="mt-5 rounded-3xl border border-white/10 bg-white/[0.025] p-6 text-center"
+                  initial={{ opacity: 0, scale: 0.96 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  className={`rounded-[36px] border-4 border-[#20263d] p-5 shadow-[0_9px_0_#20263d] sm:p-7 ${roundResult.civiliansWon ? "bg-[#7bd13f]" : "bg-[#ff625f]"}`}
                 >
-                  <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-amber-300/10">
-                    {roundResult.civiliansWon ? (
-                      <Trophy className="h-7 w-7 text-amber-200/80" />
-                    ) : (
-                      <Skull className="h-7 w-7 text-red-200/80" />
-                    )}
+                  <div className="text-center">
+                    <div className="text-7xl">{roundResult.civiliansWon ? "🎉" : "😈"}</div>
+                    <div className="mt-3 text-xs font-black uppercase tracking-[0.2em] text-[#20263d]/60">
+                      ROUND {roundResult.round} RESULT
+                    </div>
+                    <h2 className="mt-2 text-4xl font-black uppercase sm:text-5xl">
+                      {roundResult.civiliansWon ? "CIVILIANS WON!" : "IMPOSTOR WON!"}
+                    </h2>
                   </div>
 
-                  <p className="mt-4 text-xs uppercase tracking-[0.2em] text-white/25">
-                    Round{" "}
-                    {
-                      roundResult.round
-                    }{" "}
-                    result
-                  </p>
-
-                  <h2 className="mt-1 text-2xl font-bold">
-                    {roundResult.civiliansWon
-                      ? "Civilians caught the imposter!"
-                      : "The imposter survived!"}
-                  </h2>
-
-                  <div className="mt-5 grid grid-cols-2 gap-2">
-                    <div className="rounded-xl border border-white/5 bg-white/[0.025] p-3">
-                      <p className="text-[10px] uppercase tracking-wider text-white/20">
-                        Imposter
-                      </p>
-
-                      <p className="mt-1 text-sm text-red-200/80">
-                        {
-                          roundResult.imposterName
-                        }
-                      </p>
+                  <div className="mt-6 grid gap-3 sm:grid-cols-3">
+                    <div className="rounded-[24px] border-4 border-[#20263d] bg-white p-4 text-center shadow-[0_5px_0_#20263d]">
+                      <div className="text-[10px] font-black uppercase tracking-wider text-[#7b86a5]">IMPOSTOR</div>
+                      <div className="mt-1 text-2xl font-black">{roundResult.imposterName}</div>
                     </div>
-
-                    <div className="rounded-xl border border-white/5 bg-white/[0.025] p-3">
-                      <p className="text-[10px] uppercase tracking-wider text-white/20">
-                        Word
-                      </p>
-
-                      <p className="mt-1 text-sm text-emerald-200/80">
-                        {
-                          roundResult.word
-                        }
-                      </p>
+                    <div className="rounded-[24px] border-4 border-[#20263d] bg-white p-4 text-center shadow-[0_5px_0_#20263d]">
+                      <div className="text-[10px] font-black uppercase tracking-wider text-[#7b86a5]">SECRET WORD</div>
+                      <div className="mt-1 text-2xl font-black">{roundResult.word}</div>
+                    </div>
+                    <div className="rounded-[24px] border-4 border-[#20263d] bg-white p-4 text-center shadow-[0_5px_0_#20263d]">
+                      <div className="text-[10px] font-black uppercase tracking-wider text-[#7b86a5]">MOST VOTED</div>
+                      <div className="mt-1 text-2xl font-black">{roundResult.eliminatedName || "TIE — NOBODY"}</div>
                     </div>
                   </div>
 
-                  {roundResult.eliminatedName && (
-                    <p className="mt-4 text-xs text-white/30">
-                      Most voted:{" "}
-                      <span className="text-white/60">
-                        {
-                          roundResult.eliminatedName
-                        }
-                      </span>
-                    </p>
+                  {/* WHO VOTED WHOM */}
+                  <div className="mt-5 rounded-[28px] border-4 border-[#20263d] bg-white p-4 shadow-[0_5px_0_#20263d] sm:p-5">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <div className="text-[10px] font-black uppercase tracking-[0.2em] text-[#7b86a5]">THE RECEIPTS 🧾</div>
+                        <h3 className="mt-1 text-2xl font-black">Who voted whom?</h3>
+                      </div>
+                      <div className="rounded-full border-3 border-[#20263d] bg-[#ffd34d] px-3 py-1 text-xs font-black">
+                        {roundResult.votes.length} VOTES
+                      </div>
+                    </div>
+
+                    <div className="mt-4 grid gap-2">
+                      {roundResult.votes.length > 0 ? (
+                        roundResult.votes.map((vote) => (
+                          <div key={`${vote.voterId}-${vote.targetId}`} className="flex items-center gap-2 rounded-2xl border-3 border-[#20263d] bg-[#eef9ff] p-3">
+                            <div className="min-w-0 flex-1 truncate font-black">{vote.voterName}</div>
+                            <div className="shrink-0 text-lg font-black">→</div>
+                            <div className="min-w-0 flex-1 truncate rounded-xl border-2 border-[#20263d] bg-white px-2 py-1 text-right font-black">{vote.targetName}</div>
+                          </div>
+                        ))
+                      ) : (
+                        <div className="rounded-2xl border-3 border-dashed border-[#20263d] p-4 text-center font-bold text-[#68718e]">
+                          Vote details will appear after the updated server is deployed.
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* VOTE TOTALS */}
+                  <div className="mt-5 rounded-[28px] border-4 border-[#20263d] bg-[#303a70] p-4 text-white shadow-[0_5px_0_#20263d] sm:p-5">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <div className="text-[10px] font-black uppercase tracking-[0.2em] text-white/60">VOTE COUNT</div>
+                        <h3 className="mt-1 text-2xl font-black">Where did the votes land?</h3>
+                      </div>
+                      <span className="text-2xl">🗳️</span>
+                    </div>
+                    <div className="mt-4 grid gap-2 sm:grid-cols-2">
+                      {players.map((player, index) => {
+                        const count = roundResult.voteCounts[player.id] || 0;
+                        const isImposter = player.id === roundResult.imposterId;
+                        const isEliminated = player.id === roundResult.eliminatedId;
+                        return (
+                          <div key={player.id} className={`flex items-center gap-3 rounded-2xl border-3 border-[#20263d] p-3 ${isImposter ? "bg-[#ff625f] text-[#20263d]" : "bg-white text-[#20263d]"}`}>
+                            <div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border-2 border-[#20263d] bg-white text-xs font-black ${playerColors[index % playerColors.length]}`}>
+                              {count}
+                            </div>
+                            <div className="min-w-0 flex-1">
+                              <div className="truncate font-black">{player.name}</div>
+                              <div className="text-[9px] font-black uppercase opacity-60">
+                                {isImposter ? "😈 IMPOSTOR" : isEliminated ? "☠ MOST VOTED" : "PLAYER"}
+                              </div>
+                            </div>
+                            <div className="text-xl font-black">{count === 1 ? "vote" : "votes"}</div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* ROUND SCOREBOARD */}
+                  <div className="mt-5 rounded-[28px] border-4 border-[#20263d] bg-white p-4 shadow-[0_5px_0_#20263d] sm:p-5">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <div className="text-[10px] font-black uppercase tracking-[0.2em] text-[#7b86a5]">SCOREBOARD</div>
+                        <h3 className="mt-1 text-2xl font-black">Who is leading? 🏆</h3>
+                      </div>
+                      <span className="text-2xl">⭐</span>
+                    </div>
+                    <div className="mt-4 grid gap-2">
+                      {roundResult.scoreboard.map((entry, index) => (
+                        <div key={entry.playerId} className={`flex items-center gap-3 rounded-2xl border-3 border-[#20263d] p-3 ${index === 0 ? "bg-[#ffd34d]" : "bg-[#eef9ff]"}`}>
+                          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border-2 border-[#20263d] bg-white font-black">
+                            {index === 0 ? "👑" : `#${index + 1}`}
+                          </div>
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate font-black">{entry.playerName}</div>
+                            <div className="text-[9px] font-black uppercase text-[#7b86a5]">+{entry.roundPoints} THIS ROUND</div>
+                          </div>
+                          <div className="rounded-xl border-2 border-[#20263d] bg-white px-3 py-1 text-xl font-black">{entry.score}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </motion.div>
+              )}
+
+              {/* FINAL RESULTS */}
+              {finalWinner && (
+                <motion.div
+                  initial={{ opacity: 0, y: 12 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  className={`rounded-[38px] border-4 border-[#20263d] p-6 shadow-[0_10px_0_#20263d] sm:p-8 ${finalWinner === "civilians" ? "bg-[#20c4e8]" : "bg-[#ff625f]"}`}
+                >
+                  <div className="text-center">
+                    <div className="text-8xl">{finalWinner === "civilians" ? "🏆" : "😈"}</div>
+                    <div className="mt-3 text-xs font-black uppercase tracking-[0.2em] text-[#20263d]/60">FINAL GAME RESULT</div>
+                    <h2 className="mt-2 text-5xl font-black uppercase sm:text-6xl">
+                      {finalWinner === "civilians" ? "CIVILIANS WIN!" : "IMPOSTOR WINS!"}
+                    </h2>
+                    <p className="mt-2 text-lg font-black text-[#20263d]/70">Final scores are in.</p>
+                  </div>
+
+                  {finalScoreboard.length > 0 && (
+                    <div className="mt-6 rounded-[30px] border-4 border-[#20263d] bg-white p-4 shadow-[0_6px_0_#20263d] sm:p-5">
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <div className="text-[10px] font-black uppercase tracking-[0.2em] text-[#7b86a5]">FINAL LEADERBOARD</div>
+                          <h3 className="mt-1 text-2xl font-black">Highest score 👑</h3>
+                        </div>
+                        {finalScoreboard[0] && (
+                          <div className="rounded-full border-3 border-[#20263d] bg-[#ffd34d] px-3 py-1 text-xs font-black">
+                            {finalScoreboard[0].playerName}: {finalScoreboard[0].score}
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="mt-4 grid gap-2">
+                        {finalScoreboard.map((entry, index) => (
+                          <div key={entry.playerId} className={`flex items-center gap-3 rounded-2xl border-3 border-[#20263d] p-3 ${index === 0 ? "bg-[#ffd34d]" : "bg-[#eef9ff]"}`}>
+                            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border-2 border-[#20263d] bg-white font-black">
+                              {index === 0 ? "👑" : `#${index + 1}`}
+                            </div>
+                            <div className="min-w-0 flex-1 truncate font-black">{entry.playerName}</div>
+                            <div className="rounded-xl border-2 border-[#20263d] bg-white px-3 py-1 text-xl font-black">{entry.score}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
                   )}
                 </motion.div>
               )}
-
-              {/* =================================================
-                  FINAL
-              ================================================= */}
-
-              {finalWinner && (
-                <motion.div
-                  initial={{
-                    opacity: 0,
-                    y: 15,
-                  }}
-                  animate={{
-                    opacity: 1,
-                    y: 0,
-                  }}
-                  className="mt-6 rounded-3xl border border-violet-300/10 bg-violet-400/[0.06] p-8 text-center"
-                >
-                  <Trophy className="mx-auto h-10 w-10 text-amber-200/80" />
-
-                  <h2 className="mt-4 text-3xl font-bold">
-                    {finalWinner ===
-                    "civilians"
-                      ? "Civilians Win!"
-                      : "Imposter Wins!"}
-                  </h2>
-
-                  <p className="mt-2 text-sm text-white/35">
-                    The game has
-                    ended.
-                  </p>
-                </motion.div>
-              )}
             </div>
           )}
         </div>
 
-        {/* =================================================
-            CHAT
-        ================================================= */}
-
-        <div className="flex h-[calc(100svh-120px)] min-h-[430px] max-h-[700px] flex-col overflow-hidden rounded-3xl border border-fuchsia-400/10 bg-gradient-to-b from-white/[0.045] to-white/[0.02] shadow-2xl shadow-black/20 backdrop-blur-xl lg:h-auto lg:min-h-0 lg:max-h-none">
-          <div className="flex items-center gap-3 border-b border-white/10 px-5 py-4">
-            <div className="relative rounded-xl bg-violet-400/10 p-2.5">
-              <MessageCircle className="h-4 w-4 text-violet-300" />
-
-              {messages.length >
-                0 && (
-                <span className="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-violet-300" />
-              )}
-            </div>
-
-            <div className="min-w-0">
-              <h2 className="font-medium">
-                Lobby chat
-              </h2>
-
-              <p className="text-xs text-white/30">
-                {game
-                  ? "Talk, accuse, confuse everyone."
-                  : "Talk, accuse, confuse everyone."}
-              </p>
-            </div>
-
-            <div className="ml-auto rounded-full border border-emerald-300/10 bg-emerald-300/5 px-2.5 py-1 text-[10px] uppercase tracking-wider text-emerald-200/50">
-              Live
-            </div>
+        {/* CHAT */}
+        <aside
+          className="relative isolate flex h-[68dvh] min-h-[380px] max-h-[680px] min-w-0 flex-col overflow-hidden rounded-[32px] border-4 border-[#20263d] bg-white shadow-[0_8px_0_#20263d] lg:sticky lg:top-5 lg:h-[calc(100dvh-105px)] lg:min-h-0 lg:max-h-none"
+          style={{ WebkitTransform: "translateZ(0)" }}
+        >
+          <div className="flex shrink-0 items-center gap-3 border-b-4 border-[#20263d] bg-[#303a70] px-5 py-4 text-white">
+            <div className="flex h-12 w-12 items-center justify-center rounded-2xl border-3 border-[#20263d] bg-[#20c4e8] text-2xl">💬</div>
+            <div className="min-w-0"><h2 className="text-xl font-black">CHAOS CHAT</h2><p className="text-xs font-bold text-white/60">Accuse. Defend. Confuse.</p></div>
+            <span className="ml-auto rounded-full border-3 border-[#20263d] bg-[#7bd13f] px-3 py-1 text-[10px] font-black text-[#20263d]">LIVE</span>
           </div>
 
-          {/* Messages */}
-
-          <div
-            ref={chatScrollRef}
-            onScroll={updateChatScrollState}
-            className="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-y-contain px-3 py-4 [scrollbar-width:thin] [scrollbar-gutter:stable] sm:space-y-4 sm:px-4 sm:py-5"
-            style={{
-              WebkitOverflowScrolling: "touch",
-              overscrollBehaviorY: "contain",
-              touchAction: "pan-y",
-            }}
-          >
-            {messages.length ===
-              0 && (
-              <div className="flex h-full min-h-[400px] items-center justify-center">
-                <div className="px-6 text-center">
-                  <MessageCircle className="mx-auto h-7 w-7 text-white/15" />
-
-                  <p className="mt-3 text-sm text-white/25">
-                    No messages yet.
-                  </p>
-
-                  <p className="mt-1 text-xs text-white/15">
-                    The chaos starts
-                    when your friends
-                    arrive.
-                  </p>
-                </div>
-              </div>
-            )}
-
-            {messages.map(
-              (item) => {
-                const system =
-                  item.playerId ===
-                  "system";
-
-                const mine =
-                  item.playerId ===
-                  playerId;
-
-                if (system) {
-                  return (
-                    <div
-                      key={item.id}
-                      className="py-1 text-center"
-                    >
-                      <span className="rounded-full border border-white/5 bg-white/[0.025] px-3 py-1 text-[10px] text-white/25">
-                        {
-                          item.message
-                        }
-                      </span>
-                    </div>
-                  );
-                }
-
-                return (
-                  <div
-                    key={item.id}
-                    className={`flex ${
-                      mine
-                        ? "justify-end"
-                        : "justify-start"
-                    }`}
-                  >
-                    <div
-                      className={`flex max-w-[88%] flex-col ${
-                        mine
-                          ? "items-end"
-                          : "items-start"
-                      }`}
-                    >
-                      <div
-                        className={`mb-1 flex items-center gap-1.5 px-1 ${
-                          mine
-                            ? "flex-row-reverse"
-                            : ""
-                        }`}
-                      >
-                        <span className="text-[11px] font-medium text-violet-300/70">
-                          {
-                            item.playerName
-                          }
-                        </span>
-
-                        {mine && (
-                          <span className="rounded-full bg-violet-300/10 px-1.5 py-0.5 text-[8px] uppercase tracking-wider text-violet-200/50">
-                            You
-                          </span>
-                        )}
-
-                        <span className="text-[9px] text-white/15">
-                          {formatTime(
-                            item.timestamp,
-                          )}
-                        </span>
-                      </div>
-
-                      <div
-                        className={`rounded-2xl px-3.5 py-2.5 text-sm leading-5 ${
-                          mine
-                            ? "rounded-br-md bg-gradient-to-br from-fuchsia-500/20 via-violet-500/20 to-indigo-500/15 text-white shadow-lg shadow-violet-950/10"
-                            : "rounded-bl-md bg-white/[0.065] text-white/75"
-                        }`}
-                      >
-                        {
-                          item.message
-                        }
-                      </div>
-                    </div>
-                  </div>
-                );
-              },
-            )}
-
-          </div>
-
-          {unreadChatCount > 0 && !chatNearBottomRef.current && (
-            <button
-              type="button"
-              onClick={() => {
-                chatNearBottomRef.current = true;
-                setUnreadChatCount(0);
-                scrollChatToBottom(true);
+          <div className="relative min-h-0 flex-1 overflow-hidden">
+            <div
+              ref={chatScrollRef}
+              onScroll={handleChatScroll}
+              className="absolute inset-0 min-h-0 overflow-y-scroll overscroll-y-contain px-3 py-4 sm:px-4"
+              style={{
+                WebkitOverflowScrolling: "touch",
+                touchAction: "pan-y",
+                scrollbarGutter: "stable",
               }}
-              className="mx-auto -mb-2 z-10 rounded-full border border-violet-300/20 bg-violet-500/90 px-3 py-1.5 text-[11px] font-semibold text-white shadow-lg shadow-violet-950/40 backdrop-blur-md"
             >
-              {unreadChatCount} new message{unreadChatCount === 1 ? "" : "s"} ↓
-            </button>
-          )}
+              <div className="flex min-h-full flex-col justify-end gap-3">
+                {messages.length === 0 && <div className="flex min-h-[240px] items-center justify-center px-5 text-center"><div><div className="text-5xl">🦗</div><p className="mt-3 text-lg font-black text-[#20263d]">Crickets...</p><p className="mt-1 text-sm font-bold text-[#7b86a5]">Someone say something suspicious.</p></div></div>}
+            {messages.map((item) => {
+              const system = item.playerId === "system";
+              const mine = item.playerId === playerId;
+              if (system) return <div key={item.id} className="py-1 text-center"><span className="inline-block max-w-full rounded-full border-3 border-[#20263d] bg-[#eef9ff] px-3 py-1 text-[10px] font-black text-[#68718e]">{item.message}</span></div>;
+              return <div key={item.id} className={`flex ${mine ? "justify-end" : "justify-start"}`}><div className={`flex max-w-[88%] flex-col ${mine ? "items-end" : "items-start"}`}><div className={`mb-1 flex items-center gap-1.5 px-1 text-[10px] font-black text-[#7b86a5] ${mine ? "flex-row-reverse" : ""}`}><span>{item.playerName}</span>{mine && <span className="rounded-full bg-[#b28cff]/30 px-1.5 py-0.5 text-[8px]">YOU</span>}<span className="font-bold text-[#a5aec4]">{formatTime(item.timestamp)}</span></div><div className={`border-3 border-[#20263d] px-3.5 py-2.5 text-sm font-bold leading-5 shadow-[0_3px_0_#20263d] ${mine ? "rounded-2xl rounded-br-md bg-[#b28cff] text-[#20263d]" : "rounded-2xl rounded-bl-md bg-[#eef9ff] text-[#20263d]"}`}>{item.message}</div></div></div>;
+              })}
+              </div>
+            </div>
 
-          {/* Input */}
-
-          <div className="border-t border-white/10 bg-[#0b0a14]/70 p-3">
-            <div className="flex items-center gap-2 rounded-2xl border border-white/10 bg-black/20 p-1.5 transition-colors focus-within:border-violet-300/20">
-              <input
-                ref={messageInputRef}
-                maxLength={300}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" && !event.nativeEvent.isComposing) {
-                    event.preventDefault();
-                    sendMessage();
-                  }
-                }}
-                placeholder={
-                  game
-                    ? "Chat during the game..."
-                    : "Say something suspicious..."
-                }
-                disabled={
-                  connection !==
-                  "connected"
-                }
-                className="min-w-0 flex-1 bg-transparent px-3 py-2 text-sm text-white outline-none placeholder:text-white/20"
-              />
-
+            {chatUnread > 0 && (
               <button
-                onClick={
-                  sendMessage
-                }
-                disabled={
-                  connection !==
-                    "connected"
-                }
-                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-white text-[#070611] disabled:opacity-20"
-                aria-label="Send message"
+                type="button"
+                onClick={() => scrollChatToBottom("smooth")}
+                className="absolute bottom-3 left-1/2 z-10 -translate-x-1/2 rounded-full border-4 border-[#20263d] bg-[#ffd34d] px-4 py-2 text-xs font-black text-[#20263d] shadow-[0_5px_0_#20263d] active:translate-y-0.5 active:shadow-[0_3px_0_#20263d]"
               >
-                <Send className="h-4 w-4" />
+                ↓ {chatUnread} NEW {chatUnread === 1 ? "MESSAGE" : "MESSAGES"}
               </button>
+            )}
+          </div>
+
+          <div className="shrink-0 border-t-4 border-[#20263d] bg-[#f8fcff] p-3">
+            <div className="flex items-center gap-2 rounded-[20px] border-4 border-[#20263d] bg-white p-1.5 focus-within:bg-[#eef9ff]">
+              <input ref={messageInputRef} maxLength={300} onKeyDown={(event) => { if (event.key === "Enter" && !event.nativeEvent.isComposing) { event.preventDefault(); sendMessage(); } }} placeholder={game ? "Say something sus..." : "Say something..."} disabled={connection !== "connected"} className="min-w-0 flex-1 bg-transparent px-3 py-2 text-sm font-bold text-[#20263d] outline-none placeholder:text-[#9ba5bb]" />
+              <button onClick={sendMessage} disabled={connection !== "connected"} className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border-3 border-[#20263d] bg-[#20c4e8] text-white shadow-[0_3px_0_#20263d] disabled:opacity-30" aria-label="Send message">➤</button>
             </div>
           </div>
-        </div>
+        </aside>
       </section>
     </main>
   );
@@ -2734,23 +2057,21 @@ function SettingSelect({
   onChange: (value: number) => void;
 }) {
   return (
-    <label className="group block rounded-2xl border border-white/10 bg-black/15 p-3 transition hover:border-fuchsia-300/20 hover:bg-white/[0.035]">
-      <span className="text-[10px] font-semibold uppercase tracking-wider text-white/30">
-        {label}
-      </span>
+    <label className="block rounded-[22px] border-3 border-[#20263d] bg-white p-3 shadow-[0_4px_0_#20263d]">
+      <span className="text-[10px] font-black uppercase tracking-[0.16em] text-[#7b86a5]">{label}</span>
       <div className="relative mt-2">
         <select
           value={value}
           onChange={(event) => onChange(Number(event.target.value))}
-          className="w-full appearance-none rounded-xl border border-white/10 bg-white/[0.055] px-3 py-2.5 pr-8 text-sm font-semibold text-white outline-none transition focus:border-fuchsia-300/30 focus:ring-2 focus:ring-fuchsia-400/10"
+          className="w-full appearance-none rounded-2xl border-3 border-[#20263d] bg-[#eef9ff] px-3 py-3 pr-9 text-sm font-black text-[#20263d] outline-none"
         >
           {options.map((option) => (
-            <option key={option} value={option} className="bg-[#12101f] text-white">
+            <option key={option} value={option}>
               {option}{suffix}
             </option>
           ))}
         </select>
-        <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-white/30">⌄</span>
+        <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-lg font-black text-[#20263d]">⌄</span>
       </div>
     </label>
   );
@@ -2764,14 +2085,9 @@ function SettingPill({
   value: string | number;
 }) {
   return (
-    <div className="rounded-xl border border-white/5 bg-white/[0.025] px-3 py-2">
-      <p className="text-[10px] uppercase tracking-wider text-white/20">
-        {label}
-      </p>
-
-      <p className="mt-1 text-sm text-white/55">
-        {value}
-      </p>
+    <div className="rounded-[20px] border-3 border-[#20263d] bg-white p-3 shadow-[0_4px_0_#20263d]">
+      <p className="text-[9px] font-black uppercase tracking-wider text-[#7b86a5]">{label}</p>
+      <p className="mt-1 text-base font-black text-[#20263d]">{value}</p>
     </div>
   );
 }
