@@ -483,7 +483,11 @@ export class MyDurableObject extends DurableObject<Env> {
       return;
     }
 
-    const settings = normalizeSettings(requestedSettings);
+    const currentSettings = await this.getRoomSettings();
+    const settings = normalizeSettings({
+      ...currentSettings,
+      ...requestedSettings,
+    });
     await this.setRoomSettings(settings);
 
     this.broadcast({
@@ -668,9 +672,11 @@ export class MyDurableObject extends DurableObject<Env> {
     const players =
       this.getPlayers();
 
-    const settings = requestedSettings
-      ? normalizeSettings(requestedSettings)
-      : await this.getRoomSettings();
+    const storedSettings = await this.getRoomSettings();
+    const settings = normalizeSettings({
+      ...storedSettings,
+      ...(requestedSettings ?? {}),
+    });
 
     if (players.length < MIN_PLAYERS) {
       this.send(socket, {
@@ -1476,23 +1482,28 @@ export class MyDurableObject extends DurableObject<Env> {
             playerId,
         );
 
-      if (
-        !alreadyJoined &&
-        existingPlayers.length >=
-          MAX_PLAYERS
-      ) {
-        this.send(socket, {
-          type: "error",
-          message:
-            "This room is full.",
-        });
+      if (!alreadyJoined) {
+        const roomSettings = await this.getRoomSettings();
 
-        socket.close(
-          4001,
-          "Room full",
-        );
+        if (existingPlayers.length >= roomSettings.players) {
+          this.send(socket, {
+            type: "error",
+            message: `This room is full. The host set the limit to ${roomSettings.players} players.`,
+          });
 
-        return;
+          socket.close(4001, "Room full");
+          return;
+        }
+
+        if (existingPlayers.length >= MAX_PLAYERS) {
+          this.send(socket, {
+            type: "error",
+            message: "This room is full.",
+          });
+
+          socket.close(4001, "Room full");
+          return;
+        }
       }
 
       const session: Session = {

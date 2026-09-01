@@ -325,6 +325,15 @@ export default function RoomPage() {
       null,
     );
 
+  const chatNearBottomRef =
+    useRef(true);
+
+  const chatAutoScrollFrameRef =
+    useRef<number | null>(null);
+
+  const [unreadChatCount, setUnreadChatCount] =
+    useState(0);
+
   const [playerId, setPlayerId] =
     useState("");
 
@@ -981,11 +990,12 @@ export default function RoomPage() {
               },
             );
 
-            if (
-              data.playerId !==
-              id
-            ) {
+            if (data.playerId !== id) {
               playChatSound();
+
+              if (!chatNearBottomRef.current) {
+                setUnreadChatCount((count) => count + 1);
+              }
             }
 
             return;
@@ -1155,10 +1165,10 @@ export default function RoomPage() {
   }, [game]);
 
   // =====================================================
-  // AUTO SCROLL
+  // CHAT SCROLL
   // =====================================================
 
-  useEffect(() => {
+  const updateChatScrollState = useCallback(() => {
     const container = chatScrollRef.current;
     if (!container) return;
 
@@ -1167,15 +1177,64 @@ export default function RoomPage() {
       container.scrollTop -
       container.clientHeight;
 
-    // Avoid expensive animated scrolling on mobile. Only follow new
-    // messages when the user is already near the bottom.
-    if (distanceFromBottom < 160) {
-      container.scrollTop = container.scrollHeight;
+    chatNearBottomRef.current = distanceFromBottom <= 72;
+
+    if (chatNearBottomRef.current) {
+      setUnreadChatCount(0);
     }
-  }, [messages]);
+  }, []);
+
+  const scrollChatToBottom = useCallback((smooth = false) => {
+    const container = chatScrollRef.current;
+    if (!container) return;
+
+    if (chatAutoScrollFrameRef.current !== null) {
+      cancelAnimationFrame(chatAutoScrollFrameRef.current);
+    }
+
+    chatAutoScrollFrameRef.current = requestAnimationFrame(() => {
+      chatAutoScrollFrameRef.current = null;
+      const current = chatScrollRef.current;
+      if (!current) return;
+
+      current.scrollTo({
+        top: current.scrollHeight,
+        left: 0,
+        behavior: smooth ? "smooth" : "auto",
+      });
+    });
+  }, []);
+
+  useEffect(() => {
+    if (chatNearBottomRef.current) {
+      scrollChatToBottom(false);
+    }
+
+    return () => {
+      if (chatAutoScrollFrameRef.current !== null) {
+        cancelAnimationFrame(chatAutoScrollFrameRef.current);
+        chatAutoScrollFrameRef.current = null;
+      }
+    };
+  }, [messages, scrollChatToBottom]);
+
+  useEffect(() => {
+    const container = chatScrollRef.current;
+    if (!container || typeof ResizeObserver === "undefined") return;
+
+    const resizeObserver = new ResizeObserver(() => {
+      if (chatNearBottomRef.current) {
+        scrollChatToBottom(false);
+      }
+    });
+
+    resizeObserver.observe(container);
+    return () => resizeObserver.disconnect();
+  }, [scrollChatToBottom]);
 
   // =====================================================
   // SEND CHAT
+
   // =====================================================
 
   const sendMessage = () => {
@@ -1250,6 +1309,7 @@ export default function RoomPage() {
     socketRef.current.send(
       JSON.stringify({
         type: "start_game",
+        settings: roomSettings,
       }),
     );
   };
@@ -1783,7 +1843,16 @@ export default function RoomPage() {
                 </div>
 
                 {isHost ? (
-                  <div className="mt-4 grid gap-3 sm:grid-cols-3">
+                  <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                    <SettingSelect
+                      label="Players"
+                      value={roomSettings.players}
+                      options={[2, 3, 4, 5, 6, 7, 8, 9, 10]}
+                      suffix=" players"
+                      onChange={(value) =>
+                        updateRoomSetting({ players: value })
+                      }
+                    />
                     <SettingSelect
                       label="Rounds"
                       value={roomSettings.rounds}
@@ -1813,7 +1882,8 @@ export default function RoomPage() {
                     />
                   </div>
                 ) : (
-                  <div className="mt-4 grid grid-cols-3 gap-2">
+                  <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
+                    <SettingPill label="Players" value={roomSettings.players} />
                     <SettingPill label="Rounds" value={roomSettings.rounds} />
                     <SettingPill label="Clue" value={`${roomSettings.clueTime}s`} />
                     <SettingPill label="Talk" value={`${roomSettings.discussionTime}s`} />
@@ -1835,7 +1905,9 @@ export default function RoomPage() {
                     startGame
                   }
                   disabled={
-                    players.length < 4 || startingGame
+                    players.length < 2 ||
+                    players.length > roomSettings.players ||
+                    startingGame
                   }
                   className="mt-6 flex h-16 w-full items-center justify-center gap-3 rounded-2xl bg-gradient-to-r from-fuchsia-500 via-violet-500 to-indigo-500 font-semibold text-white shadow-xl shadow-violet-500/20 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-30"
                 >
@@ -2443,7 +2515,7 @@ export default function RoomPage() {
             CHAT
         ================================================= */}
 
-        <div className="flex min-h-[520px] flex-col overflow-hidden rounded-3xl border border-fuchsia-400/10 bg-gradient-to-b from-white/[0.045] to-white/[0.02] shadow-2xl shadow-black/20 backdrop-blur-xl lg:min-h-0">
+        <div className="flex h-[calc(100svh-120px)] min-h-[430px] max-h-[700px] flex-col overflow-hidden rounded-3xl border border-fuchsia-400/10 bg-gradient-to-b from-white/[0.045] to-white/[0.02] shadow-2xl shadow-black/20 backdrop-blur-xl lg:h-auto lg:min-h-0 lg:max-h-none">
           <div className="flex items-center gap-3 border-b border-white/10 px-5 py-4">
             <div className="relative rounded-xl bg-violet-400/10 p-2.5">
               <MessageCircle className="h-4 w-4 text-violet-300" />
@@ -2475,7 +2547,13 @@ export default function RoomPage() {
 
           <div
             ref={chatScrollRef}
-            className="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain px-3 py-4 [scrollbar-width:thin] [scrollbar-gutter:stable] sm:space-y-4 sm:px-4 sm:py-5"
+            onScroll={updateChatScrollState}
+            className="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-y-contain px-3 py-4 [scrollbar-width:thin] [scrollbar-gutter:stable] sm:space-y-4 sm:px-4 sm:py-5"
+            style={{
+              WebkitOverflowScrolling: "touch",
+              overscrollBehaviorY: "contain",
+              touchAction: "pan-y",
+            }}
           >
             {messages.length ===
               0 && (
@@ -2582,9 +2660,23 @@ export default function RoomPage() {
 
           </div>
 
+          {unreadChatCount > 0 && !chatNearBottomRef.current && (
+            <button
+              type="button"
+              onClick={() => {
+                chatNearBottomRef.current = true;
+                setUnreadChatCount(0);
+                scrollChatToBottom(true);
+              }}
+              className="mx-auto -mb-2 z-10 rounded-full border border-violet-300/20 bg-violet-500/90 px-3 py-1.5 text-[11px] font-semibold text-white shadow-lg shadow-violet-950/40 backdrop-blur-md"
+            >
+              {unreadChatCount} new message{unreadChatCount === 1 ? "" : "s"} ↓
+            </button>
+          )}
+
           {/* Input */}
 
-          <div className="border-t border-white/10 p-3">
+          <div className="border-t border-white/10 bg-[#0b0a14]/70 p-3">
             <div className="flex items-center gap-2 rounded-2xl border border-white/10 bg-black/20 p-1.5 transition-colors focus-within:border-violet-300/20">
               <input
                 ref={messageInputRef}
