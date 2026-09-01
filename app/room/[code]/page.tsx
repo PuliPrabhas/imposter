@@ -1171,56 +1171,46 @@ export default function RoomPage() {
   // =====================================================
 
   useEffect(() => {
-    const id =
-      getPlayerId();
+  const id = getPlayerId();
 
-    const storedName =
-      sessionStorage.getItem(
-        "imposter_player_name",
-      ) ||
-      localStorage.getItem(
-        "imposter_player_name",
-      );
-
-    setPlayerId(id);
-
-    setPlayerName(
-      storedName || "",
-    );
-
-    if (!storedName) {
-      return;
-    }
-
-    sessionStorage.setItem(
+  const storedName =
+    sessionStorage.getItem(
       "imposter_player_name",
-      storedName,
     );
 
-    connect(
-      id,
-      storedName,
-    );
+  setPlayerId(id);
 
-    return () => {
-      const socket =
-        socketRef.current;
+  setPlayerName(
+    storedName || "",
+  );
 
-      socketRef.current =
-        null;
+  if (!storedName) {
+    return;
+  }
 
-      if (
-        socket &&
-        socket.readyState ===
-          WebSocket.OPEN
-      ) {
-        socket.close(
-          1000,
-          "Leaving room",
-        );
-      }
-    };
-  }, [connect]);
+  connect(
+    id,
+    storedName,
+  );
+
+  return () => {
+    const socket =
+      socketRef.current;
+
+    socketRef.current = null;
+
+    if (
+      socket &&
+      socket.readyState ===
+        WebSocket.OPEN
+    ) {
+      socket.close(
+        1000,
+        "Leaving room",
+      );
+    }
+  };
+}, [connect]);
 
   // =====================================================
   // TIMER

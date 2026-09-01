@@ -39,6 +39,20 @@ type GamePhase =
   | "voting"
   | "results";
 
+type VoteDetail = {
+  voterId: string;
+  voterName: string;
+  targetId: string;
+  targetName: string;
+};
+
+type ScoreEntry = {
+  playerId: string;
+  playerName: string;
+  score: number;
+  roundPoints: number;
+};
+
 type GameState = {
   status: "lobby" | "playing" | "finished";
   round: number;
@@ -65,6 +79,7 @@ type GameState = {
   >;
 
   votes: Record<string, string>;
+  scores: Record<string, number>;
   civilianRoundsWon: number;
   imposterRoundsWon: number;
 
@@ -88,10 +103,6 @@ type ClientMessage =
   | {
       type: "chat";
       message: string;
-    }
-  | {
-      type: "settings_update";
-      settings: Partial<RoomSettings>;
     }
   | {
       type: "start_game";
@@ -139,10 +150,6 @@ type ServerMessage =
       timestamp: number;
     }
   | {
-      type: "settings_updated";
-      roomSettings: RoomSettings;
-    }
-  | {
       type: "game_started";
       game: PublicGameState;
       roomSettings?: RoomSettings;
@@ -179,6 +186,10 @@ type ServerMessage =
       imposterName: string;
       word: string;
       voteCounts: Record<string, number>;
+      votes: VoteDetail[];
+      roundScores: Record<string, number>;
+      scores: Record<string, number>;
+      scoreboard: ScoreEntry[];
       eliminatedId: string | null;
       eliminatedName: string | null;
       civiliansWon: boolean;
@@ -188,6 +199,8 @@ type ServerMessage =
       type: "game_finished";
       winner: "civilians" | "imposter";
       rounds: number;
+      scores: Record<string, number>;
+      scoreboard: ScoreEntry[];
     }
   | {
       type: "pong";
@@ -458,44 +471,6 @@ export class MyDurableObject extends DurableObject<Env> {
     await this.ctx.storage.put("roomSettings", settings);
   }
 
-  private async updateRoomSettings(
-    socket: WebSocket,
-    playerId: string,
-    requestedSettings: Partial<RoomSettings>,
-  ) {
-    const hostPlayerId = await this.getHostPlayerId();
-
-    if (hostPlayerId !== playerId) {
-      this.send(socket, {
-        type: "error",
-        message: "Only the host can change game settings.",
-      });
-      return;
-    }
-
-    const game = await this.getGame();
-
-    if (game?.status === "playing") {
-      this.send(socket, {
-        type: "error",
-        message: "Game settings cannot be changed after the game starts.",
-      });
-      return;
-    }
-
-    const currentSettings = await this.getRoomSettings();
-    const settings = normalizeSettings({
-      ...currentSettings,
-      ...requestedSettings,
-    });
-    await this.setRoomSettings(settings);
-
-    this.broadcast({
-      type: "settings_updated",
-      roomSettings: settings,
-    });
-  }
-
   // =======================================================
   // GAME STATE
   // =======================================================
@@ -672,11 +647,7 @@ export class MyDurableObject extends DurableObject<Env> {
     const players =
       this.getPlayers();
 
-    const storedSettings = await this.getRoomSettings();
-    const settings = normalizeSettings({
-      ...storedSettings,
-      ...(requestedSettings ?? {}),
-    });
+    const settings = normalizeSettings(requestedSettings);
 
     if (players.length < MIN_PLAYERS) {
       this.send(socket, {
@@ -716,6 +687,7 @@ export class MyDurableObject extends DurableObject<Env> {
     players: Player[],
     suppliedSettings?: RoomSettings,
     previousScores?: { civilianRoundsWon: number; imposterRoundsWon: number },
+    previousPlayerScores?: Record<string, number>,
   ) {
     if (players.length < 2) {
       return;
@@ -771,6 +743,7 @@ export class MyDurableObject extends DurableObject<Env> {
       roles,
       clues: {},
       votes: {},
+      scores: previousPlayerScores ?? {},
       civilianRoundsWon: previousScores?.civilianRoundsWon ?? 0,
       imposterRoundsWon: previousScores?.imposterRoundsWon ?? 0,
     };
@@ -1057,75 +1030,36 @@ export class MyDurableObject extends DurableObject<Env> {
   private async resolveRound(
     game: GameState,
   ) {
-    if (
-      game.phase !== "voting"
-    ) {
+    if (game.phase !== "voting") {
       return;
     }
 
-    const voteCounts: Record<
-      string,
-      number
-    > = {};
+    const players = this.getPlayers();
+    const playerById = new Map(players.map((player) => [player.id, player]));
 
-    for (const targetId of Object.values(
-      game.votes,
-    )) {
-      voteCounts[targetId] =
-        (voteCounts[targetId] ||
-          0) + 1;
+    const voteCounts: Record<string, number> = {};
+    for (const targetId of Object.values(game.votes)) {
+      voteCounts[targetId] = (voteCounts[targetId] || 0) + 1;
     }
 
-    let eliminatedId:
-      | string
-      | null = null;
-
+    let eliminatedId: string | null = null;
     let highestVotes = 0;
 
-    for (const [
-      playerId,
-      count,
-    ] of Object.entries(
-      voteCounts,
-    )) {
-      if (
-        count > highestVotes
-      ) {
-        highestVotes =
-          count;
-        eliminatedId =
-          playerId;
-      } else if (
-        count ===
-        highestVotes
-      ) {
-        // Tie means nobody is eliminated.
+    for (const [targetId, count] of Object.entries(voteCounts)) {
+      if (count > highestVotes) {
+        highestVotes = count;
+        eliminatedId = targetId;
+      } else if (count === highestVotes) {
         eliminatedId = null;
       }
     }
 
-    const players =
-      this.getPlayers();
+    const imposter = playerById.get(game.imposterId);
+    const eliminated = eliminatedId
+      ? playerById.get(eliminatedId)
+      : undefined;
 
-    const imposter =
-      players.find(
-        (player) =>
-          player.id ===
-          game.imposterId,
-      );
-
-    const eliminated =
-      eliminatedId
-        ? players.find(
-            (player) =>
-              player.id ===
-              eliminatedId,
-          )
-        : undefined;
-
-    const civiliansWon =
-      eliminatedId ===
-      game.imposterId;
+    const civiliansWon = eliminatedId === game.imposterId;
 
     if (civiliansWon) {
       game.civilianRoundsWon += 1;
@@ -1133,52 +1067,88 @@ export class MyDurableObject extends DurableObject<Env> {
       game.imposterRoundsWon += 1;
     }
 
+    // Build a complete, safe result payload for the premium results UI.
+    // Older persisted games may not have a scores object, so always migrate it.
+    const scores: Record<string, number> = { ...(game.scores ?? {}) };
+    for (const player of players) {
+      if (typeof scores[player.id] !== "number" || !Number.isFinite(scores[player.id])) {
+        scores[player.id] = 0;
+      }
+    }
+
+    const roundScores: Record<string, number> = {};
+    for (const player of players) {
+      roundScores[player.id] = 0;
+    }
+
+    // Correct voters earn a point when civilians catch the imposter.
+    // The imposter earns a point when they survive. This does not alter the
+    // existing win/elimination rules; it only supplies the scoreboard UI.
+    if (civiliansWon) {
+      for (const [voterId, targetId] of Object.entries(game.votes)) {
+        if (targetId === game.imposterId) {
+          roundScores[voterId] = (roundScores[voterId] || 0) + 1;
+        }
+      }
+    } else if (scores[game.imposterId] !== undefined) {
+      roundScores[game.imposterId] = 1;
+    }
+
+    for (const player of players) {
+      scores[player.id] = (scores[player.id] || 0) + (roundScores[player.id] || 0);
+    }
+
+    game.scores = scores;
+
+    const votes: VoteDetail[] = Object.entries(game.votes).map(
+      ([voterId, targetId]) => ({
+        voterId,
+        voterName: playerById.get(voterId)?.name || "Unknown",
+        targetId,
+        targetName: playerById.get(targetId)?.name || "Unknown",
+      }),
+    );
+
+    const scoreboard: ScoreEntry[] = players
+      .map((player) => ({
+        playerId: player.id,
+        playerName: player.name,
+        score: scores[player.id] || 0,
+        roundPoints: roundScores[player.id] || 0,
+      }))
+      .sort((a, b) => b.score - a.score || a.playerName.localeCompare(b.playerName));
+
     game.lastResult = {
-      imposterId:
-        game.imposterId,
-      imposterName:
-        imposter?.name ||
-        "Unknown",
+      imposterId: game.imposterId,
+      imposterName: imposter?.name || "Unknown",
       word: game.word,
       voteCounts,
       eliminatedId,
-      eliminatedName:
-        eliminated?.name ||
-        null,
+      eliminatedName: eliminated?.name || null,
       civiliansWon,
     };
 
-    game.phase =
-      "results";
-
-    game.phaseEndsAt =
-      Date.now() +
-      RESULT_TIME * 1000;
+    game.phase = "results";
+    game.phaseEndsAt = Date.now() + RESULT_TIME * 1000;
 
     await this.saveGame(game);
-
-    await this.ctx.storage.setAlarm(
-      game.phaseEndsAt,
-    );
+    await this.ctx.storage.setAlarm(game.phaseEndsAt);
 
     this.broadcast({
       type: "round_results",
       round: game.round,
-      imposterId:
-        game.imposterId,
-      imposterName:
-        imposter?.name ||
-        "Unknown",
+      imposterId: game.imposterId,
+      imposterName: imposter?.name || "Unknown",
       word: game.word,
       voteCounts,
+      votes,
+      roundScores,
+      scores,
+      scoreboard,
       eliminatedId,
-      eliminatedName:
-        eliminated?.name ||
-        null,
+      eliminatedName: eliminated?.name || null,
       civiliansWon,
-      nextRound:
-        game.round <
-        game.totalRounds,
+      nextRound: game.round < game.totalRounds,
     });
   }
 
@@ -1291,6 +1261,7 @@ export class MyDurableObject extends DurableObject<Env> {
             civilianRoundsWon: game.civilianRoundsWon,
             imposterRoundsWon: game.imposterRoundsWon,
           },
+          game.scores,
         );
       } else {
         game.status =
@@ -1309,11 +1280,22 @@ export class MyDurableObject extends DurableObject<Env> {
                 ? "civilians"
                 : "imposter";
 
+        const finalScores: Record<string, number> = { ...(game.scores ?? {}) };
+        const finalScoreboard: ScoreEntry[] = this.getPlayers()
+          .map((player) => ({
+            playerId: player.id,
+            playerName: player.name,
+            score: finalScores[player.id] || 0,
+            roundPoints: 0,
+          }))
+          .sort((a, b) => b.score - a.score || a.playerName.localeCompare(b.playerName));
+
         this.broadcast({
           type: "game_finished",
           winner,
-          rounds:
-            game.totalRounds,
+          rounds: game.totalRounds,
+          scores: finalScores,
+          scoreboard: finalScoreboard,
         });
       }
     }
@@ -1475,35 +1457,45 @@ export class MyDurableObject extends DurableObject<Env> {
       const existingPlayers =
         this.getPlayers();
 
-      const alreadyJoined =
-        existingPlayers.some(
+      const existingPlayer =
+        existingPlayers.find(
           (player) =>
             player.id ===
             playerId,
         );
 
-      if (!alreadyJoined) {
-        const roomSettings = await this.getRoomSettings();
+      const alreadyJoined =
+        Boolean(existingPlayer);
 
-        if (existingPlayers.length >= roomSettings.players) {
-          this.send(socket, {
-            type: "error",
-            message: `This room is full. The host set the limit to ${roomSettings.players} players.`,
-          });
+      // A player can reconnect with the same playerId but a new
+      // display name. Because getPlayers() is derived from active
+      // WebSocket attachments, the old socket may still be present
+      // for a moment after close(). Build the public list explicitly
+      // with the name from THIS join request so the entered name wins.
+      const nameChanged =
+        Boolean(
+          existingPlayer &&
+            existingPlayer.name !==
+              playerName,
+        );
 
-          socket.close(4001, "Room full");
-          return;
-        }
+      if (
+        !alreadyJoined &&
+        existingPlayers.length >=
+          MAX_PLAYERS
+      ) {
+        this.send(socket, {
+          type: "error",
+          message:
+            "This room is full.",
+        });
 
-        if (existingPlayers.length >= MAX_PLAYERS) {
-          this.send(socket, {
-            type: "error",
-            message: "This room is full.",
-          });
+        socket.close(
+          4001,
+          "Room full",
+        );
 
-          socket.close(4001, "Room full");
-          return;
-        }
+        return;
       }
 
       const session: Session = {
@@ -1522,7 +1514,17 @@ export class MyDurableObject extends DurableObject<Env> {
         await this.getHostPlayerId();
 
       const players =
-        this.getPlayers();
+        this.getPlayers().map(
+          (player) =>
+            player.id === playerId
+              ? {
+                  ...player,
+                  name: playerName,
+                  joinedAt:
+                    session.joinedAt,
+                }
+              : player,
+        );
 
       const publicGame =
         await this.getPublicGame();
@@ -1576,7 +1578,7 @@ export class MyDurableObject extends DurableObject<Env> {
         });
       }
 
-      if (!alreadyJoined) {
+      if (!alreadyJoined || nameChanged) {
         this.broadcast(
           {
             type: "player_joined",
@@ -1614,20 +1616,6 @@ export class MyDurableObject extends DurableObject<Env> {
 
     const playerId =
       currentSession.playerId;
-
-    // -----------------------------------------------------
-    // SETTINGS UPDATE
-    // -----------------------------------------------------
-
-    if (data.type === "settings_update") {
-      await this.updateRoomSettings(
-        socket,
-        playerId,
-        data.settings,
-      );
-
-      return;
-    }
 
     // -----------------------------------------------------
     // START GAME

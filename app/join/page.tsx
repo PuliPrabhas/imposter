@@ -12,8 +12,18 @@ import Link from "next/link";
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 
+/* =========================================================
+   PLAYER ID
+   ---------------------------------------------------------
+   Each browser tab gets its own player ID.
+
+   IMPORTANT:
+   We use sessionStorage instead of localStorage so that
+   multiple tabs can behave as different players.
+========================================================= */
+
 const getPlayerId = () => {
-  const existing = localStorage.getItem(
+  const existing = sessionStorage.getItem(
     "imposter_player_id",
   );
 
@@ -23,7 +33,10 @@ const getPlayerId = () => {
 
   const id = crypto.randomUUID();
 
-  localStorage.setItem("imposter_player_id", id);
+  sessionStorage.setItem(
+    "imposter_player_id",
+    id,
+  );
 
   return id;
 };
@@ -35,36 +48,91 @@ export default function JoinPage() {
   const [code, setCode] = useState("");
   const [joining, setJoining] = useState(false);
 
+  /* =======================================================
+     JOIN GAME
+  ======================================================= */
+
   const joinGame = () => {
+    if (joining) {
+      return;
+    }
+
     const cleanName = name.trim();
+
     const cleanCode = code
       .trim()
       .toUpperCase();
 
-    if (!cleanName || cleanCode.length < 4) {
+    if (
+      !cleanName ||
+      cleanCode.length < 4
+    ) {
       return;
     }
 
     setJoining(true);
 
-    getPlayerId();
+    /*
+      Get/create the ID for THIS browser tab.
+    */
+    const playerId = getPlayerId();
 
-    localStorage.setItem(
+    /*
+      Store the identity for this tab.
+
+      The room page will read these values and send them
+      to the WebSocket server.
+    */
+    sessionStorage.setItem(
+      "imposter_player_id",
+      playerId,
+    );
+
+    sessionStorage.setItem(
       "imposter_player_name",
       cleanName,
     );
 
-    localStorage.setItem(
+    /*
+      This player joined through the Join page,
+      therefore they are not the host.
+    */
+    sessionStorage.setItem(
       "imposter_room_host",
       "false",
     );
 
-    router.push(`/room/${cleanCode}`);
+    /*
+      Remove old localStorage identity values.
+
+      Older versions of the app used localStorage.
+      Leaving them around can cause stale names/IDs
+      to interfere with the new session-based system.
+    */
+    localStorage.removeItem(
+      "imposter_player_id",
+    );
+
+    localStorage.removeItem(
+      "imposter_player_name",
+    );
+
+    /*
+      Do NOT remove imposter_room_settings here.
+      Those settings belong to the room/host UI.
+    */
+
+    router.push(
+      `/room/${encodeURIComponent(cleanCode)}`,
+    );
   };
 
   return (
     <main className="relative min-h-screen overflow-hidden bg-[#0b0b12] text-white">
-      {/* Ambient background */}
+      {/* ===================================================
+          AMBIENT BACKGROUND
+      =================================================== */}
+
       <div className="pointer-events-none absolute inset-0">
         <motion.div
           className="absolute -left-40 -top-40 h-[28rem] w-[28rem] rounded-full bg-violet-500/10 blur-3xl"
@@ -97,11 +165,19 @@ export default function JoinPage() {
         <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,transparent_0%,#0b0b12_78%)]" />
       </div>
 
+      {/* ===================================================
+          HEADER
+      =================================================== */}
+
       <header className="relative z-10 flex items-center px-5 py-5 sm:px-8">
         <Link href="/">
           <motion.div
-            whileHover={{ x: -2 }}
-            whileTap={{ scale: 0.94 }}
+            whileHover={{
+              x: -2,
+            }}
+            whileTap={{
+              scale: 0.94,
+            }}
             className="flex items-center gap-2 rounded-full border border-white/10 bg-white/5 px-4 py-2.5 text-sm text-white/60 backdrop-blur-xl transition-colors hover:bg-white/10 hover:text-white"
           >
             <ArrowLeft className="h-4 w-4" />
@@ -110,7 +186,15 @@ export default function JoinPage() {
         </Link>
       </header>
 
+      {/* ===================================================
+          JOIN FORM
+      =================================================== */}
+
       <section className="relative z-10 mx-auto flex min-h-[calc(100vh-90px)] w-full max-w-xl flex-col justify-center px-5 pb-16 sm:px-8">
+        {/* -------------------------------------------------
+            TITLE
+        ------------------------------------------------- */}
+
         <motion.div
           initial={{
             opacity: 0,
@@ -140,6 +224,10 @@ export default function JoinPage() {
           </p>
         </motion.div>
 
+        {/* -------------------------------------------------
+            INPUT CARDS
+        ------------------------------------------------- */}
+
         <motion.div
           initial={{
             opacity: 0,
@@ -155,7 +243,10 @@ export default function JoinPage() {
           }}
           className="space-y-4"
         >
-          {/* Name */}
+          {/* ===============================================
+              PLAYER NAME
+          =============================================== */}
+
           <div className="rounded-3xl border border-white/10 bg-white/[0.045] p-5 backdrop-blur-xl sm:p-6">
             <div className="flex items-center gap-3">
               <div className="rounded-xl bg-violet-400/10 p-2.5">
@@ -175,17 +266,35 @@ export default function JoinPage() {
 
             <input
               value={name}
-              onChange={(event) =>
-                setName(event.target.value.slice(0, 20))
-              }
+              onChange={(event) => {
+                setName(
+                  event.target.value.slice(
+                    0,
+                    20,
+                  ),
+                );
+              }}
+              onKeyDown={(event) => {
+                if (
+                  event.key === "Enter" &&
+                  name.trim() &&
+                  code.trim().length >= 4
+                ) {
+                  joinGame();
+                }
+              }}
               placeholder="Enter your name"
               maxLength={20}
               autoComplete="nickname"
-              className="mt-5 h-13 w-full rounded-2xl border border-white/10 bg-black/20 px-4 text-sm text-white outline-none placeholder:text-white/25 transition-all focus:border-violet-300/30 focus:bg-white/[0.06]"
+              disabled={joining}
+              className="mt-5 h-13 w-full rounded-2xl border border-white/10 bg-black/20 px-4 text-sm text-white outline-none placeholder:text-white/25 transition-all focus:border-violet-300/30 focus:bg-white/[0.06] disabled:cursor-not-allowed disabled:opacity-50"
             />
           </div>
 
-          {/* Room code */}
+          {/* ===============================================
+              ROOM CODE
+          =============================================== */}
+
           <div className="rounded-3xl border border-white/10 bg-white/[0.045] p-5 backdrop-blur-xl sm:p-6">
             <div className="flex items-center gap-3">
               <div className="rounded-xl bg-violet-400/10 p-2.5">
@@ -205,19 +314,23 @@ export default function JoinPage() {
 
             <input
               value={code}
-              onChange={(event) =>
-                setCode(
+              onChange={(event) => {
+                const nextCode =
                   event.target.value
                     .toUpperCase()
-                    .replace(/[^A-Z0-9]/g, "")
-                    .slice(0, 6),
-                )
-              }
+                    .replace(
+                      /[^A-Z0-9]/g,
+                      "",
+                    )
+                    .slice(0, 6);
+
+                setCode(nextCode);
+              }}
               onKeyDown={(event) => {
                 if (
                   event.key === "Enter" &&
                   name.trim() &&
-                  code.trim()
+                  code.trim().length >= 4
                 ) {
                   joinGame();
                 }
@@ -225,10 +338,17 @@ export default function JoinPage() {
               placeholder="A7K92"
               maxLength={6}
               autoCapitalize="characters"
-              className="mt-5 h-16 w-full rounded-2xl border border-white/10 bg-black/20 px-4 text-center text-2xl font-semibold tracking-[0.3em] text-white outline-none placeholder:text-white/15 transition-all focus:border-violet-300/30 focus:bg-white/[0.06]"
+              autoComplete="off"
+              spellCheck={false}
+              disabled={joining}
+              className="mt-5 h-16 w-full rounded-2xl border border-white/10 bg-black/20 px-4 text-center text-2xl font-semibold tracking-[0.3em] text-white outline-none placeholder:text-white/15 transition-all focus:border-violet-300/30 focus:bg-white/[0.06] disabled:cursor-not-allowed disabled:opacity-50"
             />
           </div>
         </motion.div>
+
+        {/* =================================================
+            JOIN BUTTON
+        ================================================= */}
 
         <motion.button
           initial={{
@@ -243,13 +363,21 @@ export default function JoinPage() {
             delay: 0.3,
             duration: 0.6,
           }}
-          whileHover={{
-            y: -2,
-            scale: 1.01,
-          }}
-          whileTap={{
-            scale: 0.98,
-          }}
+          whileHover={
+            joining
+              ? undefined
+              : {
+                  y: -2,
+                  scale: 1.01,
+                }
+          }
+          whileTap={
+            joining
+              ? undefined
+              : {
+                  scale: 0.98,
+                }
+          }
           disabled={
             !name.trim() ||
             code.trim().length < 4 ||
@@ -258,7 +386,10 @@ export default function JoinPage() {
           onClick={joinGame}
           className="mt-7 flex h-14 w-full items-center justify-center gap-2 rounded-2xl bg-white text-base font-semibold text-[#0b0b12] shadow-2xl shadow-white/5 transition-all hover:shadow-white/10 disabled:cursor-not-allowed disabled:opacity-40"
         >
-          {joining ? "Joining..." : "Join Game"}
+          {joining
+            ? "Joining..."
+            : "Join Game"}
+
           {!joining && (
             <ArrowRight className="h-4 w-4" />
           )}
