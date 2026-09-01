@@ -1,6 +1,23 @@
 import { DurableObject } from "cloudflare:workers";
 
 const MAX_PLAYERS = 10;
+const MIN_PLAYERS = 2;
+
+// All timing values are stored in seconds. Keeping them in the game state
+// makes every client and every alarm use the exact same server-side clock.
+type RoomSettings = {
+  players: number;
+  rounds: number;
+  clueTime: number;
+  discussionTime: number;
+};
+
+const DEFAULT_SETTINGS: RoomSettings = {
+  players: 5,
+  rounds: 5,
+  clueTime: 30,
+  discussionTime: 60,
+};
 
 type Player = {
   id: string;
@@ -26,8 +43,11 @@ type GameState = {
   status: "lobby" | "playing" | "finished";
   round: number;
   totalRounds: number;
+  settings: RoomSettings;
 
   phase: GamePhase;
+  currentCluePlayerId?: string;
+
   phaseEndsAt: number;
 
   word: string;
@@ -45,6 +65,8 @@ type GameState = {
   >;
 
   votes: Record<string, string>;
+  civilianRoundsWon: number;
+  imposterRoundsWon: number;
 
   lastResult?: {
     imposterId: string;
@@ -68,7 +90,12 @@ type ClientMessage =
       message: string;
     }
   | {
+      type: "settings_update";
+      settings: Partial<RoomSettings>;
+    }
+  | {
       type: "start_game";
+      settings?: Partial<RoomSettings>;
     }
   | {
       type: "clue";
@@ -88,6 +115,7 @@ type ServerMessage =
       playerId: string;
       players: Player[];
       hostPlayerId: string;
+      roomSettings: RoomSettings;
       game?: PublicGameState;
     }
   | {
@@ -111,8 +139,13 @@ type ServerMessage =
       timestamp: number;
     }
   | {
+      type: "settings_updated";
+      roomSettings: RoomSettings;
+    }
+  | {
       type: "game_started";
       game: PublicGameState;
+      roomSettings?: RoomSettings;
     }
   | {
       type: "private_role";
@@ -125,12 +158,14 @@ type ServerMessage =
       round: number;
       phase: GamePhase;
       phaseEndsAt: number;
+      currentCluePlayerId?: string;
     }
   | {
       type: "clue_submitted";
       playerId: string;
       playerName: string;
       clue: string;
+      nextPlayerId?: string;
     }
   | {
       type: "vote_update";
@@ -168,6 +203,7 @@ type PublicGameState = {
   totalRounds: number;
   phase: GamePhase;
   phaseEndsAt: number;
+  currentCluePlayerId?: string;
   clues: Array<{
     playerId: string;
     playerName: string;
@@ -208,10 +244,23 @@ const WORDS = [
   "Car",
 ];
 
-const CLUE_TIME = 30;
-const DISCUSSION_TIME = 60;
 const VOTING_TIME = 30;
 const RESULT_TIME = 8;
+
+function clampInt(value: unknown, min: number, max: number, fallback: number) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.round(n)));
+}
+
+function normalizeSettings(input?: Partial<RoomSettings>): RoomSettings {
+  return {
+    players: clampInt(input?.players, MIN_PLAYERS, MAX_PLAYERS, DEFAULT_SETTINGS.players),
+    rounds: clampInt(input?.rounds, 1, 20, DEFAULT_SETTINGS.rounds),
+    clueTime: clampInt(input?.clueTime, 10, 120, DEFAULT_SETTINGS.clueTime),
+    discussionTime: clampInt(input?.discussionTime, 15, 300, DEFAULT_SETTINGS.discussionTime),
+  };
+}
 
 export class MyDurableObject extends DurableObject<Env> {
   constructor(
@@ -400,16 +449,62 @@ export class MyDurableObject extends DurableObject<Env> {
     return firstPlayer.id;
   }
 
+  private async getRoomSettings(): Promise<RoomSettings> {
+    const stored = await this.ctx.storage.get<RoomSettings>("roomSettings");
+    return normalizeSettings(stored);
+  }
+
+  private async setRoomSettings(settings: RoomSettings) {
+    await this.ctx.storage.put("roomSettings", settings);
+  }
+
+  private async updateRoomSettings(
+    socket: WebSocket,
+    playerId: string,
+    requestedSettings: Partial<RoomSettings>,
+  ) {
+    const hostPlayerId = await this.getHostPlayerId();
+
+    if (hostPlayerId !== playerId) {
+      this.send(socket, {
+        type: "error",
+        message: "Only the host can change game settings.",
+      });
+      return;
+    }
+
+    const game = await this.getGame();
+
+    if (game?.status === "playing") {
+      this.send(socket, {
+        type: "error",
+        message: "Game settings cannot be changed after the game starts.",
+      });
+      return;
+    }
+
+    const settings = normalizeSettings(requestedSettings);
+    await this.setRoomSettings(settings);
+
+    this.broadcast({
+      type: "settings_updated",
+      roomSettings: settings,
+    });
+  }
+
   // =======================================================
   // GAME STATE
   // =======================================================
 
   private async getGame(): Promise<GameState | null> {
-    return (
-      (await this.ctx.storage.get<GameState>(
-        "game",
-      )) ?? null
-    );
+    const game = await this.ctx.storage.get<GameState>("game");
+    if (!game) return null;
+
+    // Backward-compatible migration for rooms created by the previous build.
+    game.settings = normalizeSettings(game.settings);
+    game.civilianRoundsWon ??= 0;
+    game.imposterRoundsWon ??= 0;
+    return game;
   }
 
   private async saveGame(
@@ -448,6 +543,8 @@ export class MyDurableObject extends DurableObject<Env> {
       phase: game.phase,
       phaseEndsAt:
         game.phaseEndsAt,
+      currentCluePlayerId:
+        game.currentCluePlayerId,
       clues:
         Object.values(
           game.clues,
@@ -537,6 +634,7 @@ export class MyDurableObject extends DurableObject<Env> {
   private async startGame(
     socket: WebSocket,
     playerId: string,
+    requestedSettings?: Partial<RoomSettings>,
   ) {
     const host =
       await this.getHostPlayerId();
@@ -570,7 +668,11 @@ export class MyDurableObject extends DurableObject<Env> {
     const players =
       this.getPlayers();
 
-    if (players.length < 2) {
+    const settings = requestedSettings
+      ? normalizeSettings(requestedSettings)
+      : await this.getRoomSettings();
+
+    if (players.length < MIN_PLAYERS) {
       this.send(socket, {
         type: "error",
         message:
@@ -580,13 +682,21 @@ export class MyDurableObject extends DurableObject<Env> {
       return;
     }
 
-    const totalRounds =
-      5;
+    if (players.length > settings.players) {
+      this.send(socket, {
+        type: "error",
+        message: `Room limit is ${settings.players} players. Remove extra players before starting.`,
+      });
+      return;
+    }
+
+    await this.setRoomSettings(settings);
 
     await this.startRound(
       1,
-      totalRounds,
+      settings.rounds,
       players,
+      settings,
     );
   }
 
@@ -598,6 +708,8 @@ export class MyDurableObject extends DurableObject<Env> {
     round: number,
     totalRounds: number,
     players: Player[],
+    suppliedSettings?: RoomSettings,
+    previousScores?: { civilianRoundsWon: number; imposterRoundsWon: number },
   ) {
     if (players.length < 2) {
       return;
@@ -633,22 +745,28 @@ export class MyDurableObject extends DurableObject<Env> {
           : "civilian";
     }
 
+    const settings = suppliedSettings ?? await this.getRoomSettings();
+    const cluePlayer = players[0];
     const phaseEndsAt =
       Date.now() +
-      CLUE_TIME * 1000;
+      settings.clueTime * 1000;
 
     const game: GameState = {
       status: "playing",
       round,
       totalRounds,
+      settings,
       phase: "clue",
       phaseEndsAt,
+      currentCluePlayerId: cluePlayer.id,
       word,
       imposterId:
         imposter.id,
       roles,
       clues: {},
       votes: {},
+      civilianRoundsWon: previousScores?.civilianRoundsWon ?? 0,
+      imposterRoundsWon: previousScores?.imposterRoundsWon ?? 0,
     };
 
     await this.saveGame(game);
@@ -667,6 +785,7 @@ export class MyDurableObject extends DurableObject<Env> {
     this.broadcast({
       type: "game_started",
       game: publicGame,
+      roomSettings: settings,
     });
 
     this.broadcast({
@@ -674,6 +793,7 @@ export class MyDurableObject extends DurableObject<Env> {
       round,
       phase: "clue",
       phaseEndsAt,
+      currentCluePlayerId: cluePlayer.id,
     });
 
     await this.sendPrivateRoles(
@@ -689,11 +809,14 @@ export class MyDurableObject extends DurableObject<Env> {
     game: GameState,
     phase: GamePhase,
     seconds: number,
+    currentCluePlayerId?: string,
   ) {
     game.phase = phase;
     game.phaseEndsAt =
       Date.now() +
       seconds * 1000;
+    game.currentCluePlayerId =
+      phase === "clue" ? currentCluePlayerId : undefined;
 
     await this.saveGame(game);
 
@@ -707,6 +830,8 @@ export class MyDurableObject extends DurableObject<Env> {
       phase,
       phaseEndsAt:
         game.phaseEndsAt,
+      currentCluePlayerId:
+        game.currentCluePlayerId,
     });
   }
 
@@ -756,6 +881,14 @@ export class MyDurableObject extends DurableObject<Env> {
       return;
     }
 
+    if (game.currentCluePlayerId !== playerId) {
+      this.send(socket, {
+        type: "error",
+        message: "It is not your turn to give a clue yet.",
+      });
+      return;
+    }
+
     if (game.clues[playerId]) {
       this.send(socket, {
         type: "error",
@@ -783,29 +916,44 @@ export class MyDurableObject extends DurableObject<Env> {
       clue: cleanClue,
     };
 
+    const players = this.getPlayers();
+    const nextPlayer = players.find((item) => !game.clues[item.id]);
+
+    if (nextPlayer) {
+      game.currentCluePlayerId = nextPlayer.id;
+    } else {
+      game.currentCluePlayerId = undefined;
+    }
+
     await this.saveGame(game);
 
     this.broadcast({
       type: "clue_submitted",
       playerId,
-      playerName:
-        player.name,
+      playerName: player.name,
       clue: cleanClue,
+      nextPlayerId: nextPlayer?.id,
     });
 
-    const players =
-      this.getPlayers();
-
-    if (
-      Object.keys(
-        game.clues,
-      ).length >= players.length
-    ) {
+    if (!nextPlayer) {
       await this.changePhase(
         game,
         "discussion",
-        DISCUSSION_TIME,
+        game.settings.discussionTime,
       );
+    } else {
+      // Each player gets a full clue timer. The server owns the timer so
+      // mobile clients cannot drift away from the real round clock.
+      game.phaseEndsAt = Date.now() + game.settings.clueTime * 1000;
+      await this.saveGame(game);
+      await this.ctx.storage.setAlarm(game.phaseEndsAt);
+      this.broadcast({
+        type: "game_phase",
+        round: game.round,
+        phase: "clue",
+        phaseEndsAt: game.phaseEndsAt,
+        currentCluePlayerId: nextPlayer.id,
+      });
     }
   }
 
@@ -837,6 +985,14 @@ export class MyDurableObject extends DurableObject<Env> {
           "Voting is not active.",
       });
 
+      return;
+    }
+
+    if (game.votes[playerId]) {
+      this.send(socket, {
+        type: "error",
+        message: "You have already voted this round.",
+      });
       return;
     }
 
@@ -965,6 +1121,12 @@ export class MyDurableObject extends DurableObject<Env> {
       eliminatedId ===
       game.imposterId;
 
+    if (civiliansWon) {
+      game.civilianRoundsWon += 1;
+    } else {
+      game.imposterRoundsWon += 1;
+    }
+
     game.lastResult = {
       imposterId:
         game.imposterId,
@@ -1045,11 +1207,28 @@ export class MyDurableObject extends DurableObject<Env> {
     // -----------------------------------------------------
 
     if (game.phase === "clue") {
-      await this.changePhase(
-        game,
-        "discussion",
-        DISCUSSION_TIME,
-      );
+      const players = this.getPlayers();
+      const nextPlayer = players.find((player) => !game.clues[player.id]);
+
+      if (nextPlayer) {
+        game.currentCluePlayerId = nextPlayer.id;
+        game.phaseEndsAt = Date.now() + game.settings.clueTime * 1000;
+        await this.saveGame(game);
+        await this.ctx.storage.setAlarm(game.phaseEndsAt);
+        this.broadcast({
+          type: "game_phase",
+          round: game.round,
+          phase: "clue",
+          phaseEndsAt: game.phaseEndsAt,
+          currentCluePlayerId: nextPlayer.id,
+        });
+      } else {
+        await this.changePhase(
+          game,
+          "discussion",
+          game.settings.discussionTime,
+        );
+      }
 
       return;
     }
@@ -1101,6 +1280,11 @@ export class MyDurableObject extends DurableObject<Env> {
           game.round + 1,
           game.totalRounds,
           players,
+          game.settings,
+          {
+            civilianRoundsWon: game.civilianRoundsWon,
+            imposterRoundsWon: game.imposterRoundsWon,
+          },
         );
       } else {
         game.status =
@@ -1111,10 +1295,13 @@ export class MyDurableObject extends DurableObject<Env> {
         );
 
         const winner =
-          game.lastResult
-            ?.civiliansWon
+          game.civilianRoundsWon > game.imposterRoundsWon
             ? "civilians"
-            : "imposter";
+            : game.imposterRoundsWon > game.civilianRoundsWon
+              ? "imposter"
+              : game.lastResult?.civiliansWon
+                ? "civilians"
+                : "imposter";
 
         this.broadcast({
           type: "game_finished",
@@ -1328,12 +1515,14 @@ export class MyDurableObject extends DurableObject<Env> {
 
       const publicGame =
         await this.getPublicGame();
+      const roomSettings = await this.getRoomSettings();
 
       this.send(socket, {
         type: "connected",
         playerId,
         players,
         hostPlayerId,
+        roomSettings,
         game: publicGame,
       });
 
@@ -1341,6 +1530,16 @@ export class MyDurableObject extends DurableObject<Env> {
       // restore this player's private role.
       const activeGame =
         await this.getGame();
+
+      if (activeGame?.status === "playing") {
+        this.send(socket, {
+          type: "game_phase",
+          round: activeGame.round,
+          phase: activeGame.phase,
+          phaseEndsAt: activeGame.phaseEndsAt,
+          currentCluePlayerId: activeGame.currentCluePlayerId,
+        });
+      }
 
       if (
         activeGame?.status ===
@@ -1406,6 +1605,20 @@ export class MyDurableObject extends DurableObject<Env> {
       currentSession.playerId;
 
     // -----------------------------------------------------
+    // SETTINGS UPDATE
+    // -----------------------------------------------------
+
+    if (data.type === "settings_update") {
+      await this.updateRoomSettings(
+        socket,
+        playerId,
+        data.settings,
+      );
+
+      return;
+    }
+
+    // -----------------------------------------------------
     // START GAME
     // -----------------------------------------------------
 
@@ -1416,6 +1629,7 @@ export class MyDurableObject extends DurableObject<Env> {
       await this.startGame(
         socket,
         playerId,
+        data.settings,
       );
 
       return;

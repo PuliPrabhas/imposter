@@ -20,6 +20,7 @@ import {
   Lightbulb,
   Trophy,
   Skull,
+  SlidersHorizontal,
 } from "lucide-react";
 import { useParams, useRouter } from "next/navigation";
 import {
@@ -59,6 +60,20 @@ type Clue = {
   clue: string;
 };
 
+type RoomSettings = {
+  players: number;
+  rounds: number;
+  clueTime: number;
+  discussionTime: number;
+};
+
+const DEFAULT_ROOM_SETTINGS: RoomSettings = {
+  players: 5,
+  rounds: 5,
+  clueTime: 30,
+  discussionTime: 60,
+};
+
 type PublicGameState = {
   status:
     | "playing"
@@ -78,6 +93,7 @@ type ServerMessage =
       players: Player[];
       hostPlayerId: string;
       game?: PublicGameState;
+      roomSettings?: RoomSettings;
     }
   | {
       type: "player_joined";
@@ -100,8 +116,13 @@ type ServerMessage =
       timestamp: number;
     }
   | {
+      type: "settings_updated";
+      roomSettings: RoomSettings;
+    }
+  | {
       type: "game_started";
       game: PublicGameState;
+      roomSettings?: RoomSettings;
     }
   | {
       type: "private_role";
@@ -333,13 +354,11 @@ export default function RoomPage() {
   const [hostPlayerId, setHostPlayerId] =
     useState("");
 
-  const [roomSettings] =
-    useState({
-      players: 5,
-      rounds: 5,
-      clueTime: 30,
-      discussionTime: 60,
-    });
+  const [roomSettings, setRoomSettings] =
+    useState<RoomSettings>(DEFAULT_ROOM_SETTINGS);
+
+  const [startingGame, setStartingGame] =
+    useState(false);
 
   const [game, setGame] =
     useState<
@@ -407,70 +426,39 @@ export default function RoomPage() {
             window as typeof window & {
               webkitAudioContext?: typeof AudioContext;
             }
-          )
-            .webkitAudioContext;
+          ).webkitAudioContext;
 
-        if (
-          !AudioContextClass
-        ) {
-          return;
+        if (!AudioContextClass) return;
+
+        let audioContext = audioContextRef.current;
+
+        if (!audioContext) {
+          audioContext = new AudioContextClass();
+          audioContextRef.current = audioContext;
         }
 
-        const audioContext =
-          new AudioContextClass();
+        if (audioContext.state === "suspended") {
+          void audioContext.resume();
+        }
 
-        const oscillator =
-          audioContext.createOscillator();
-
-        const gain =
-          audioContext.createGain();
+        const now = audioContext.currentTime;
+        const oscillator = audioContext.createOscillator();
+        const gain = audioContext.createGain();
 
         oscillator.type = "sine";
+        oscillator.frequency.setValueAtTime(520, now);
+        oscillator.frequency.exponentialRampToValueAtTime(680, now + 0.07);
 
-        oscillator.frequency.setValueAtTime(
-          520,
-          audioContext.currentTime,
-        );
-
-        oscillator.frequency.exponentialRampToValueAtTime(
-          680,
-          audioContext.currentTime +
-            0.08,
-        );
-
-        gain.gain.setValueAtTime(
-          0.0001,
-          audioContext.currentTime,
-        );
-
-        gain.gain.exponentialRampToValueAtTime(
-          0.045,
-          audioContext.currentTime +
-            0.015,
-        );
-
-        gain.gain.exponentialRampToValueAtTime(
-          0.0001,
-          audioContext.currentTime +
-            0.11,
-        );
+        gain.gain.setValueAtTime(0.0001, now);
+        gain.gain.exponentialRampToValueAtTime(0.035, now + 0.012);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.10);
 
         oscillator.connect(gain);
-        gain.connect(
-          audioContext.destination,
-        );
-
-        oscillator.start();
-
-        oscillator.stop(
-          audioContext.currentTime +
-            0.12,
-        );
-
-        // Reuse the AudioContext instead of creating/closing one for every message.
-        // This is considerably cheaper on mobile browsers.
+        gain.connect(audioContext.destination);
+        oscillator.start(now);
+        oscillator.stop(now + 0.11);
       } catch {
-        // Optional.
+        // Sound is optional and must never affect gameplay.
       }
     }, []);
 
@@ -581,6 +569,10 @@ export default function RoomPage() {
               data.hostPlayerId,
             );
 
+            if (data.roomSettings) {
+              setRoomSettings(data.roomSettings);
+            }
+
             if (data.game) {
               setGame(
                 data.game,
@@ -682,6 +674,16 @@ export default function RoomPage() {
           }
 
           // ------------------------------------------------
+          // SETTINGS UPDATED
+          // ------------------------------------------------
+
+          if (data.type === "settings_updated") {
+            setRoomSettings(data.roomSettings);
+            setStartingGame(false);
+            return;
+          }
+
+          // ------------------------------------------------
           // GAME STARTED
           // ------------------------------------------------
 
@@ -689,6 +691,12 @@ export default function RoomPage() {
             data.type ===
             "game_started"
           ) {
+            setStartingGame(false);
+
+            if (data.roomSettings) {
+              setRoomSettings(data.roomSettings);
+            }
+
             setGame(
               data.game,
             );
@@ -965,12 +973,12 @@ export default function RoomPage() {
               };
 
             setMessages(
-              (
-                current,
-              ) => [
-                ...current,
-                newMessage,
-              ],
+              (current) => {
+                const next = [...current, newMessage];
+                return next.length > 120
+                  ? next.slice(-120)
+                  : next;
+              },
             );
 
             if (
@@ -991,6 +999,7 @@ export default function RoomPage() {
             data.type ===
             "error"
           ) {
+            setStartingGame(false);
             setError(
               data.message,
             );
@@ -1042,7 +1051,6 @@ export default function RoomPage() {
     [
       code,
       playChatSound,
-      roomSettings.rounds,
     ],
   );
 
@@ -1197,18 +1205,47 @@ export default function RoomPage() {
   };
 
   // =====================================================
+  // ROOM SETTINGS
+  // =====================================================
+
+  const updateRoomSetting = (patch: Partial<RoomSettings>) => {
+    if (
+      !isHost ||
+      socketRef.current?.readyState !== WebSocket.OPEN
+    ) {
+      return;
+    }
+
+    const nextSettings = {
+      ...roomSettings,
+      ...patch,
+    };
+
+    setRoomSettings(nextSettings);
+
+    socketRef.current.send(
+      JSON.stringify({
+        type: "settings_update",
+        settings: nextSettings,
+      }),
+    );
+  };
+
+  // =====================================================
   // START GAME
   // =====================================================
 
   const startGame = () => {
     if (
       !isHost ||
-      socketRef.current
-        ?.readyState !==
-        WebSocket.OPEN
+      startingGame ||
+      socketRef.current?.readyState !== WebSocket.OPEN
     ) {
       return;
     }
+
+    setStartingGame(true);
+    setError("");
 
     socketRef.current.send(
       JSON.stringify({
@@ -1268,9 +1305,8 @@ export default function RoomPage() {
   const submitVote = () => {
     if (
       !selectedVote ||
-      socketRef.current
-        ?.readyState !==
-        WebSocket.OPEN
+      hasSubmittedVote ||
+      socketRef.current?.readyState !== WebSocket.OPEN
     ) {
       return;
     }
@@ -1347,7 +1383,7 @@ export default function RoomPage() {
 
   if (!playerName) {
     return (
-      <main className="flex min-h-screen items-center justify-center bg-[#0b0b12] px-5 text-white">
+      <main className="flex min-h-screen items-center justify-center bg-[#070611] px-5 text-white">
         <div className="w-full max-w-md rounded-3xl border border-white/10 bg-white/[0.045] p-6 text-center backdrop-blur-xl">
           <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-violet-400/10">
             <Users className="h-6 w-6 text-violet-300" />
@@ -1376,7 +1412,7 @@ export default function RoomPage() {
                 "/join",
               )
             }
-            className="mt-6 h-12 w-full rounded-2xl bg-white font-semibold text-[#0b0b12]"
+            className="mt-6 h-12 w-full rounded-2xl bg-white font-semibold text-[#070611]"
           >
             Go to Join Game
           </motion.button>
@@ -1390,7 +1426,7 @@ export default function RoomPage() {
   // =====================================================
 
   return (
-    <main className="relative min-h-screen overflow-hidden bg-[#0b0b12] text-white">
+    <main className="relative min-h-screen overflow-hidden bg-[#070611] text-white">
       {/* Background */}
 
       <div className="pointer-events-none fixed inset-0">
@@ -1443,7 +1479,7 @@ export default function RoomPage() {
           HEADER
       ================================================= */}
 
-      <header className="relative z-10 border-b border-white/10 bg-[#0b0b12]/60 backdrop-blur-2xl">
+      <header className="relative z-10 border-b border-white/10 bg-[#070611]/60 backdrop-blur-2xl">
         <div className="mx-auto flex max-w-7xl items-center justify-between px-4 py-4 sm:px-6">
           <motion.button
             whileHover={{
@@ -1722,38 +1758,67 @@ export default function RoomPage() {
 
               {/* Settings */}
 
-              <div className="mt-6 rounded-2xl border border-white/10 bg-black/10 p-4">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs uppercase tracking-[0.18em] text-white/25">
-                    Game settings
-                  </span>
+              <div className="mt-6 overflow-hidden rounded-3xl border border-fuchsia-400/10 bg-gradient-to-br from-fuchsia-500/[0.07] via-violet-500/[0.04] to-cyan-400/[0.05] p-4 shadow-2xl shadow-violet-950/10">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2">
+                    <div className="rounded-xl bg-fuchsia-400/10 p-2">
+                      <SlidersHorizontal className="h-4 w-4 text-fuchsia-300" />
+                    </div>
+                    <div>
+                      <span className="text-xs font-semibold uppercase tracking-[0.18em] text-white/45">
+                        Game settings
+                      </span>
+                      <p className="mt-0.5 text-[11px] text-white/25">
+                        {isHost ? "Tune the chaos before you start" : "Set by the host"}
+                      </p>
+                    </div>
+                  </div>
 
                   {isHost && (
-                    <span className="flex items-center gap-1.5 text-xs text-violet-300/60">
+                    <span className="flex items-center gap-1.5 rounded-full border border-amber-300/10 bg-amber-300/5 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider text-amber-200/70">
                       <Crown className="h-3 w-3" />
                       Host
                     </span>
                   )}
                 </div>
 
-                <div className="mt-4 grid grid-cols-3 gap-2">
-                  <SettingPill
-                    label="Rounds"
-                    value={
-                      roomSettings.rounds
-                    }
-                  />
-
-                  <SettingPill
-                    label="Clue"
-                    value={`${roomSettings.clueTime}s`}
-                  />
-
-                  <SettingPill
-                    label="Talk"
-                    value={`${roomSettings.discussionTime}s`}
-                  />
-                </div>
+                {isHost ? (
+                  <div className="mt-4 grid gap-3 sm:grid-cols-3">
+                    <SettingSelect
+                      label="Rounds"
+                      value={roomSettings.rounds}
+                      options={[3, 5, 7, 10]}
+                      suffix=" rounds"
+                      onChange={(value) =>
+                        updateRoomSetting({ rounds: value })
+                      }
+                    />
+                    <SettingSelect
+                      label="Clue time"
+                      value={roomSettings.clueTime}
+                      options={[15, 30, 45, 60]}
+                      suffix=" sec"
+                      onChange={(value) =>
+                        updateRoomSetting({ clueTime: value })
+                      }
+                    />
+                    <SettingSelect
+                      label="Discussion"
+                      value={roomSettings.discussionTime}
+                      options={[30, 45, 60, 90]}
+                      suffix=" sec"
+                      onChange={(value) =>
+                        updateRoomSetting({ discussionTime: value })
+                      }
+                    />
+                  </div>
+                ) : (
+                  <div className="mt-4 grid grid-cols-3 gap-2">
+                    <SettingPill label="Rounds" value={roomSettings.rounds} />
+                    <SettingPill label="Clue" value={`${roomSettings.clueTime}s`} />
+                    <SettingPill label="Talk" value={`${roomSettings.discussionTime}s`} />
+                  </div>
+                )}
               </div>
 
               {/* START */}
@@ -1770,10 +1835,9 @@ export default function RoomPage() {
                     startGame
                   }
                   disabled={
-                    players.length <
-                    2
+                    players.length < 4 || startingGame
                   }
-                  className="mt-6 flex h-16 w-full items-center justify-center gap-3 rounded-2xl bg-violet-400 font-semibold text-[#0b0b12] shadow-xl shadow-violet-500/10 transition disabled:cursor-not-allowed disabled:opacity-30"
+                  className="mt-6 flex h-16 w-full items-center justify-center gap-3 rounded-2xl bg-gradient-to-r from-fuchsia-500 via-violet-500 to-indigo-500 font-semibold text-white shadow-xl shadow-violet-500/20 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-30"
                 >
                   <Play className="h-5 w-5 fill-current" />
 
@@ -1837,6 +1901,32 @@ export default function RoomPage() {
                 </div>
               </div>
 
+              {/* Phase rail */}
+
+              {game.status === "playing" && (
+                <div className="mt-5 grid grid-cols-4 gap-1.5">
+                  {(["clue", "discussion", "voting", "results"] as GamePhase[]).map((phase) => {
+                    const active = game.phase === phase;
+                    const phaseOrder = ["clue", "discussion", "voting", "results"];
+                    const currentIndex = phaseOrder.indexOf(game.phase);
+                    const phaseIndex = phaseOrder.indexOf(phase);
+                    const complete = phaseIndex < currentIndex;
+                    return (
+                      <div
+                        key={phase}
+                        className={`h-1.5 rounded-full transition-all duration-300 ${
+                          active
+                            ? "bg-gradient-to-r from-fuchsia-400 via-violet-400 to-cyan-300 shadow-lg shadow-violet-500/30"
+                            : complete
+                              ? "bg-violet-400/50"
+                              : "bg-white/10"
+                        }`}
+                      />
+                    );
+                  })}
+                </div>
+              )}
+
               {/* Timer */}
 
               {game.status ===
@@ -1844,10 +1934,14 @@ export default function RoomPage() {
                 game.phase !==
                   "results" && (
                   <div className="mt-6 flex items-center justify-center">
-                    <div className="flex items-center gap-3 rounded-2xl border border-violet-300/10 bg-violet-400/[0.06] px-6 py-3">
-                      <Clock className="h-4 w-4 text-violet-300" />
+                    <div className={`flex items-center gap-3 rounded-2xl border px-6 py-3 shadow-xl ${
+                        timeLeft <= 5
+                          ? "border-rose-400/30 bg-rose-500/10 shadow-rose-500/10"
+                          : "border-violet-300/15 bg-gradient-to-r from-fuchsia-500/[0.08] via-violet-500/[0.08] to-cyan-400/[0.06] shadow-violet-500/10"
+                      }`}>
+                      <Clock className={`h-4 w-4 ${timeLeft <= 5 ? "text-rose-300" : "text-violet-300"}`} />
 
-                      <span className="text-2xl font-semibold tabular-nums">
+                      <span className={`text-2xl font-bold tabular-nums ${timeLeft <= 5 ? "text-rose-200" : "text-white"}`}>
                         {timeLeft}s
                       </span>
                     </div>
@@ -1941,7 +2035,7 @@ export default function RoomPage() {
                 "playing" &&
                 game.phase ===
                   "clue" && (
-                  <div className="mt-5 overflow-hidden rounded-3xl border border-violet-300/10 bg-gradient-to-br from-violet-400/[0.08] via-white/[0.025] to-fuchsia-400/[0.04] p-5 shadow-2xl shadow-violet-950/10">
+                  <div className="mt-5 overflow-hidden rounded-3xl border border-fuchsia-400/15 bg-gradient-to-br from-fuchsia-500/[0.11] via-violet-500/[0.05] to-cyan-400/[0.06] p-5 shadow-2xl shadow-violet-950/15">
                     <div className="flex items-center justify-between gap-3">
                       <div>
                         <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-violet-200/50">
@@ -2020,7 +2114,7 @@ export default function RoomPage() {
                           hasSubmittedClue ||
                           !isMyClueTurn
                         }
-                        className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-white text-[#0b0b12] disabled:opacity-20"
+                        className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-white text-[#070611] disabled:opacity-20"
                       >
                         <Send className="h-4 w-4" />
                       </motion.button>
@@ -2162,12 +2256,11 @@ export default function RoomPage() {
                               }
                               onClick={() =>
                                 !isMe &&
-                                setSelectedVote(
-                                  player.id,
-                                )
+                                !hasSubmittedVote &&
+                                setSelectedVote(player.id)
                               }
                               disabled={
-                                isMe
+                                isMe || hasSubmittedVote
                               }
                               className={`flex items-center gap-3 rounded-xl border p-3 text-left transition ${
                                 isMe
@@ -2219,7 +2312,7 @@ export default function RoomPage() {
                       className={`mt-4 h-12 w-full rounded-xl font-semibold transition ${
                         hasSubmittedVote
                           ? "bg-emerald-300/15 text-emerald-200"
-                          : "bg-white text-[#0b0b12] disabled:opacity-20"
+                          : "bg-white text-[#070611] disabled:opacity-20"
                       }`}
                     >
                       {hasSubmittedVote ? (
@@ -2350,7 +2443,7 @@ export default function RoomPage() {
             CHAT
         ================================================= */}
 
-        <div className="flex min-h-[600px] flex-col overflow-hidden rounded-3xl border border-white/10 bg-white/[0.035] backdrop-blur-xl">
+        <div className="flex min-h-[520px] flex-col overflow-hidden rounded-3xl border border-fuchsia-400/10 bg-gradient-to-b from-white/[0.045] to-white/[0.02] shadow-2xl shadow-black/20 backdrop-blur-xl lg:min-h-0">
           <div className="flex items-center gap-3 border-b border-white/10 px-5 py-4">
             <div className="relative rounded-xl bg-violet-400/10 p-2.5">
               <MessageCircle className="h-4 w-4 text-violet-300" />
@@ -2382,7 +2475,7 @@ export default function RoomPage() {
 
           <div
             ref={chatScrollRef}
-            className="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain px-3 py-4 [scrollbar-width:thin] sm:space-y-4 sm:px-4 sm:py-5"
+            className="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain px-3 py-4 [scrollbar-width:thin] [scrollbar-gutter:stable] sm:space-y-4 sm:px-4 sm:py-5"
           >
             {messages.length ===
               0 && (
@@ -2473,8 +2566,8 @@ export default function RoomPage() {
                       <div
                         className={`rounded-2xl px-3.5 py-2.5 text-sm leading-5 ${
                           mine
-                            ? "rounded-br-md bg-violet-400/15 text-white/90"
-                            : "rounded-bl-md bg-white/[0.06] text-white/70"
+                            ? "rounded-br-md bg-gradient-to-br from-fuchsia-500/20 via-violet-500/20 to-indigo-500/15 text-white shadow-lg shadow-violet-950/10"
+                            : "rounded-bl-md bg-white/[0.065] text-white/75"
                         }`}
                       >
                         {
@@ -2496,6 +2589,12 @@ export default function RoomPage() {
               <input
                 ref={messageInputRef}
                 maxLength={300}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.nativeEvent.isComposing) {
+                    event.preventDefault();
+                    sendMessage();
+                  }
+                }}
                 placeholder={
                   game
                     ? "Chat during the game..."
@@ -2516,7 +2615,7 @@ export default function RoomPage() {
                   connection !==
                     "connected"
                 }
-                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-white text-[#0b0b12] disabled:opacity-20"
+                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-white text-[#070611] disabled:opacity-20"
                 aria-label="Send message"
               >
                 <Send className="h-4 w-4" />
@@ -2526,6 +2625,42 @@ export default function RoomPage() {
         </div>
       </section>
     </main>
+  );
+}
+
+function SettingSelect({
+  label,
+  value,
+  options,
+  suffix,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  options: number[];
+  suffix: string;
+  onChange: (value: number) => void;
+}) {
+  return (
+    <label className="group block rounded-2xl border border-white/10 bg-black/15 p-3 transition hover:border-fuchsia-300/20 hover:bg-white/[0.035]">
+      <span className="text-[10px] font-semibold uppercase tracking-wider text-white/30">
+        {label}
+      </span>
+      <div className="relative mt-2">
+        <select
+          value={value}
+          onChange={(event) => onChange(Number(event.target.value))}
+          className="w-full appearance-none rounded-xl border border-white/10 bg-white/[0.055] px-3 py-2.5 pr-8 text-sm font-semibold text-white outline-none transition focus:border-fuchsia-300/30 focus:ring-2 focus:ring-fuchsia-400/10"
+        >
+          {options.map((option) => (
+            <option key={option} value={option} className="bg-[#12101f] text-white">
+              {option}{suffix}
+            </option>
+          ))}
+        </select>
+        <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-white/30">⌄</span>
+      </div>
+    </label>
   );
 }
 
