@@ -33,12 +33,6 @@ type Session = {
 
 type Role = "civilian" | "imposter";
 
-type GamePhase =
-  | "clue"
-  | "discussion"
-  | "voting"
-  | "results";
-
 type VoteDetail = {
   voterId: string;
   voterName: string;
@@ -52,6 +46,12 @@ type ScoreEntry = {
   score: number;
   roundPoints: number;
 };
+
+type GamePhase =
+  | "clue"
+  | "discussion"
+  | "voting"
+  | "results";
 
 type GameState = {
   status: "lobby" | "playing" | "finished";
@@ -79,6 +79,8 @@ type GameState = {
   >;
 
   votes: Record<string, string>;
+  // Per-player cumulative score. Older rooms may not have this field;
+  // getGame() migrates them safely to an empty score map.
   scores: Record<string, number>;
   civilianRoundsWon: number;
   imposterRoundsWon: number;
@@ -103,6 +105,10 @@ type ClientMessage =
   | {
       type: "chat";
       message: string;
+    }
+  | {
+      type: "settings_update";
+      settings: Partial<RoomSettings>;
     }
   | {
       type: "start_game";
@@ -148,6 +154,10 @@ type ServerMessage =
       playerName: string;
       message: string;
       timestamp: number;
+    }
+  | {
+      type: "settings_updated";
+      roomSettings: RoomSettings;
     }
   | {
       type: "game_started";
@@ -471,6 +481,40 @@ export class MyDurableObject extends DurableObject<Env> {
     await this.ctx.storage.put("roomSettings", settings);
   }
 
+  private async updateRoomSettings(
+    socket: WebSocket,
+    playerId: string,
+    requestedSettings: Partial<RoomSettings>,
+  ) {
+    const hostPlayerId = await this.getHostPlayerId();
+
+    if (hostPlayerId !== playerId) {
+      this.send(socket, {
+        type: "error",
+        message: "Only the host can change game settings.",
+      });
+      return;
+    }
+
+    const game = await this.getGame();
+
+    if (game?.status === "playing") {
+      this.send(socket, {
+        type: "error",
+        message: "Game settings cannot be changed after the game starts.",
+      });
+      return;
+    }
+
+    const settings = normalizeSettings(requestedSettings);
+    await this.setRoomSettings(settings);
+
+    this.broadcast({
+      type: "settings_updated",
+      roomSettings: settings,
+    });
+  }
+
   // =======================================================
   // GAME STATE
   // =======================================================
@@ -481,6 +525,7 @@ export class MyDurableObject extends DurableObject<Env> {
 
     // Backward-compatible migration for rooms created by the previous build.
     game.settings = normalizeSettings(game.settings);
+    game.scores ??= {};
     game.civilianRoundsWon ??= 0;
     game.imposterRoundsWon ??= 0;
     return game;
@@ -647,7 +692,9 @@ export class MyDurableObject extends DurableObject<Env> {
     const players =
       this.getPlayers();
 
-    const settings = normalizeSettings(requestedSettings);
+    const settings = requestedSettings
+      ? normalizeSettings(requestedSettings)
+      : await this.getRoomSettings();
 
     if (players.length < MIN_PLAYERS) {
       this.send(socket, {
@@ -995,6 +1042,15 @@ export class MyDurableObject extends DurableObject<Env> {
       return;
     }
 
+    // Keep the same rule enforced by the UI on the server as well.
+    if (targetId === playerId) {
+      this.send(socket, {
+        type: "error",
+        message: "You cannot vote for yourself.",
+      });
+      return;
+    }
+
     game.votes[playerId] =
       targetId;
 
@@ -1030,16 +1086,22 @@ export class MyDurableObject extends DurableObject<Env> {
   private async resolveRound(
     game: GameState,
   ) {
+    // This guard is important because a completed vote can resolve the round
+    // immediately, while the voting alarm may also fire around the same time.
     if (game.phase !== "voting") {
       return;
     }
 
     const players = this.getPlayers();
-    const playerById = new Map(players.map((player) => [player.id, player]));
+    const playerById = new Map(
+      players.map((player) => [player.id, player]),
+    );
 
     const voteCounts: Record<string, number> = {};
+
     for (const targetId of Object.values(game.votes)) {
-      voteCounts[targetId] = (voteCounts[targetId] || 0) + 1;
+      voteCounts[targetId] =
+        (voteCounts[targetId] || 0) + 1;
     }
 
     let eliminatedId: string | null = null;
@@ -1050,6 +1112,7 @@ export class MyDurableObject extends DurableObject<Env> {
         highestVotes = count;
         eliminatedId = targetId;
       } else if (count === highestVotes) {
+        // Tie means nobody is eliminated.
         eliminatedId = null;
       }
     }
@@ -1067,45 +1130,60 @@ export class MyDurableObject extends DurableObject<Env> {
       game.imposterRoundsWon += 1;
     }
 
-    // Build a complete, safe result payload for the premium results UI.
-    // Older persisted games may not have a scores object, so always migrate it.
-    const scores: Record<string, number> = { ...(game.scores ?? {}) };
+    // -----------------------------------------------------
+    // PLAYER SCORING
+    // -----------------------------------------------------
+    // Preserve scores from previous rounds, while safely initializing any
+    // player that joined an older/migrated room.
+    const scores: Record<string, number> = {
+      ...(game.scores ?? {}),
+    };
+
     for (const player of players) {
-      if (typeof scores[player.id] !== "number" || !Number.isFinite(scores[player.id])) {
+      if (
+        typeof scores[player.id] !== "number" ||
+        !Number.isFinite(scores[player.id])
+      ) {
         scores[player.id] = 0;
       }
     }
 
     const roundScores: Record<string, number> = {};
+
     for (const player of players) {
       roundScores[player.id] = 0;
     }
 
-    // Correct voters earn a point when civilians catch the imposter.
-    // The imposter earns a point when they survive. This does not alter the
-    // existing win/elimination rules; it only supplies the scoreboard UI.
+    // A civilian earns 1 point for correctly voting for the imposter.
+    // The imposter earns 1 point when the civilians fail to catch them.
+    // The existing win/elimination rules are intentionally unchanged.
     if (civiliansWon) {
       for (const [voterId, targetId] of Object.entries(game.votes)) {
-        if (targetId === game.imposterId) {
-          roundScores[voterId] = (roundScores[voterId] || 0) + 1;
+        if (targetId === game.imposterId && roundScores[voterId] !== undefined) {
+          roundScores[voterId] += 1;
         }
       }
-    } else if (scores[game.imposterId] !== undefined) {
+    } else if (roundScores[game.imposterId] !== undefined) {
       roundScores[game.imposterId] = 1;
     }
 
     for (const player of players) {
-      scores[player.id] = (scores[player.id] || 0) + (roundScores[player.id] || 0);
+      scores[player.id] += roundScores[player.id] || 0;
     }
 
     game.scores = scores;
 
+    // Build the complete voter -> target list for the results UI.
     const votes: VoteDetail[] = Object.entries(game.votes).map(
       ([voterId, targetId]) => ({
         voterId,
-        voterName: playerById.get(voterId)?.name || "Unknown",
+        voterName:
+          playerById.get(voterId)?.name ||
+          "Unknown",
         targetId,
-        targetName: playerById.get(targetId)?.name || "Unknown",
+        targetName:
+          playerById.get(targetId)?.name ||
+          "Unknown",
       }),
     );
 
@@ -1116,7 +1194,11 @@ export class MyDurableObject extends DurableObject<Env> {
         score: scores[player.id] || 0,
         roundPoints: roundScores[player.id] || 0,
       }))
-      .sort((a, b) => b.score - a.score || a.playerName.localeCompare(b.playerName));
+      .sort(
+        (a, b) =>
+          b.score - a.score ||
+          a.playerName.localeCompare(b.playerName),
+      );
 
     game.lastResult = {
       imposterId: game.imposterId,
@@ -1129,10 +1211,14 @@ export class MyDurableObject extends DurableObject<Env> {
     };
 
     game.phase = "results";
-    game.phaseEndsAt = Date.now() + RESULT_TIME * 1000;
+    game.phaseEndsAt =
+      Date.now() + RESULT_TIME * 1000;
 
     await this.saveGame(game);
-    await this.ctx.storage.setAlarm(game.phaseEndsAt);
+
+    await this.ctx.storage.setAlarm(
+      game.phaseEndsAt,
+    );
 
     this.broadcast({
       type: "round_results",
@@ -1280,15 +1366,23 @@ export class MyDurableObject extends DurableObject<Env> {
                 ? "civilians"
                 : "imposter";
 
-        const finalScores: Record<string, number> = { ...(game.scores ?? {}) };
-        const finalScoreboard: ScoreEntry[] = this.getPlayers()
-          .map((player) => ({
-            playerId: player.id,
-            playerName: player.name,
-            score: finalScores[player.id] || 0,
-            roundPoints: 0,
-          }))
-          .sort((a, b) => b.score - a.score || a.playerName.localeCompare(b.playerName));
+        const finalScores: Record<string, number> = {
+          ...(game.scores ?? {}),
+        };
+
+        const finalScoreboard: ScoreEntry[] =
+          this.getPlayers()
+            .map((player) => ({
+              playerId: player.id,
+              playerName: player.name,
+              score: finalScores[player.id] || 0,
+              roundPoints: 0,
+            }))
+            .sort(
+              (a, b) =>
+                b.score - a.score ||
+                a.playerName.localeCompare(b.playerName),
+            );
 
         this.broadcast({
           type: "game_finished",
@@ -1457,26 +1551,11 @@ export class MyDurableObject extends DurableObject<Env> {
       const existingPlayers =
         this.getPlayers();
 
-      const existingPlayer =
-        existingPlayers.find(
+      const alreadyJoined =
+        existingPlayers.some(
           (player) =>
             player.id ===
             playerId,
-        );
-
-      const alreadyJoined =
-        Boolean(existingPlayer);
-
-      // A player can reconnect with the same playerId but a new
-      // display name. Because getPlayers() is derived from active
-      // WebSocket attachments, the old socket may still be present
-      // for a moment after close(). Build the public list explicitly
-      // with the name from THIS join request so the entered name wins.
-      const nameChanged =
-        Boolean(
-          existingPlayer &&
-            existingPlayer.name !==
-              playerName,
         );
 
       if (
@@ -1514,17 +1593,7 @@ export class MyDurableObject extends DurableObject<Env> {
         await this.getHostPlayerId();
 
       const players =
-        this.getPlayers().map(
-          (player) =>
-            player.id === playerId
-              ? {
-                  ...player,
-                  name: playerName,
-                  joinedAt:
-                    session.joinedAt,
-                }
-              : player,
-        );
+        this.getPlayers();
 
       const publicGame =
         await this.getPublicGame();
@@ -1578,7 +1647,7 @@ export class MyDurableObject extends DurableObject<Env> {
         });
       }
 
-      if (!alreadyJoined || nameChanged) {
+      if (!alreadyJoined) {
         this.broadcast(
           {
             type: "player_joined",
@@ -1616,6 +1685,20 @@ export class MyDurableObject extends DurableObject<Env> {
 
     const playerId =
       currentSession.playerId;
+
+    // -----------------------------------------------------
+    // SETTINGS UPDATE
+    // -----------------------------------------------------
+
+    if (data.type === "settings_update") {
+      await this.updateRoomSettings(
+        socket,
+        playerId,
+        data.settings,
+      );
+
+      return;
+    }
 
     // -----------------------------------------------------
     // START GAME
