@@ -68,6 +68,7 @@ type PublicGameState = {
   phase: GamePhase;
   phaseEndsAt: number;
   clues: Clue[];
+  currentCluePlayerId?: string;
 };
 
 type ServerMessage =
@@ -113,12 +114,14 @@ type ServerMessage =
       round: number;
       phase: GamePhase;
       phaseEndsAt: number;
+      currentCluePlayerId?: string;
     }
   | {
       type: "clue_submitted";
       playerId: string;
       playerName: string;
       clue: string;
+      nextPlayerId?: string;
     }
   | {
       type: "vote_update";
@@ -296,7 +299,7 @@ export default function RoomPage() {
       null,
     );
 
-  const chatEndRef =
+  const chatScrollRef =
     useRef<HTMLDivElement | null>(
       null,
     );
@@ -313,8 +316,8 @@ export default function RoomPage() {
   const [messages, setMessages] =
     useState<ChatMessage[]>([]);
 
-  const [message, setMessage] =
-    useState("");
+  const messageInputRef =
+    useRef<HTMLInputElement | null>(null);
 
   const [connection, setConnection] =
     useState<ConnectionState>(
@@ -365,6 +368,9 @@ export default function RoomPage() {
   const [votesSubmitted, setVotesSubmitted] =
     useState(0);
 
+  const [hasSubmittedVote, setHasSubmittedVote] =
+    useState(false);
+
   const [timeLeft, setTimeLeft] =
     useState(0);
 
@@ -388,6 +394,9 @@ export default function RoomPage() {
   // =====================================================
   // CHAT SOUND
   // =====================================================
+
+  const audioContextRef =
+    useRef<AudioContext | null>(null);
 
   const playChatSound =
     useCallback(() => {
@@ -458,11 +467,8 @@ export default function RoomPage() {
             0.12,
         );
 
-        setTimeout(() => {
-          audioContext
-            .close()
-            .catch(() => {});
-        }, 250);
+        // Reuse the AudioContext instead of creating/closing one for every message.
+        // This is considerably cheaper on mobile browsers.
       } catch {
         // Optional.
       }
@@ -709,6 +715,8 @@ export default function RoomPage() {
               0,
             );
 
+            setHasSubmittedVote(false);
+
             return;
           }
 
@@ -764,9 +772,12 @@ export default function RoomPage() {
                   data.phase,
                 phaseEndsAt:
                   data.phaseEndsAt,
+                currentCluePlayerId:
+                  data.currentCluePlayerId,
                 clues:
-                  current?.clues ||
-                  [],
+                  data.phase === "clue"
+                    ? []
+                    : current?.clues || [],
               }),
             );
 
@@ -792,6 +803,8 @@ export default function RoomPage() {
               setVotesSubmitted(
                 0,
               );
+
+              setHasSubmittedVote(false);
             }
 
             if (
@@ -814,6 +827,10 @@ export default function RoomPage() {
             data.type ===
             "clue_submitted"
           ) {
+            if (data.playerId === id) {
+              setHasSubmittedClue(true);
+            }
+
             setGame(
               (
                 current,
@@ -1120,7 +1137,7 @@ export default function RoomPage() {
     const interval =
       setInterval(
         update,
-        250,
+        1000,
       );
 
     return () =>
@@ -1134,14 +1151,19 @@ export default function RoomPage() {
   // =====================================================
 
   useEffect(() => {
-    chatEndRef.current?.scrollIntoView(
-      {
-        behavior:
-          "smooth",
-        block:
-          "nearest",
-      },
-    );
+    const container = chatScrollRef.current;
+    if (!container) return;
+
+    const distanceFromBottom =
+      container.scrollHeight -
+      container.scrollTop -
+      container.clientHeight;
+
+    // Avoid expensive animated scrolling on mobile. Only follow new
+    // messages when the user is already near the bottom.
+    if (distanceFromBottom < 160) {
+      container.scrollTop = container.scrollHeight;
+    }
   }, [messages]);
 
   // =====================================================
@@ -1150,7 +1172,7 @@ export default function RoomPage() {
 
   const sendMessage = () => {
     const cleanMessage =
-      message.trim();
+      messageInputRef.current?.value.trim() || "";
 
     if (
       !cleanMessage ||
@@ -1169,7 +1191,9 @@ export default function RoomPage() {
       }),
     );
 
-    setMessage("");
+    if (messageInputRef.current) {
+      messageInputRef.current.value = "";
+    }
   };
 
   // =====================================================
@@ -1197,6 +1221,19 @@ export default function RoomPage() {
   // SUBMIT CLUE
   // =====================================================
 
+  const currentCluePlayerId =
+    game?.currentCluePlayerId ||
+    (game?.phase === "clue" && players.length > 0
+      ? players[game.clues.length % players.length]?.id
+      : undefined);
+
+  const isMyClueTurn =
+    game?.phase === "clue" &&
+    currentCluePlayerId === playerId;
+
+  const currentCluePlayer =
+    players.find((player) => player.id === currentCluePlayerId);
+
   const submitClue = () => {
     const clean =
       clue.trim();
@@ -1204,6 +1241,7 @@ export default function RoomPage() {
     if (
       !clean ||
       hasSubmittedClue ||
+      !isMyClueTurn ||
       socketRef.current
         ?.readyState !==
         WebSocket.OPEN
@@ -1244,6 +1282,8 @@ export default function RoomPage() {
           selectedVote,
       }),
     );
+
+    setHasSubmittedVote(true);
   };
 
   // =====================================================
@@ -1512,12 +1552,12 @@ export default function RoomPage() {
           CONTENT
       ================================================= */}
 
-      <section className="relative z-10 mx-auto grid min-h-[calc(100vh-73px)] max-w-7xl gap-5 px-4 py-5 sm:px-6 lg:grid-cols-[1fr_390px]">
+      <section className="relative z-10 mx-auto grid min-h-[calc(100vh-73px)] max-w-7xl gap-4 px-3 py-3 sm:gap-5 sm:px-6 sm:py-5 lg:grid-cols-[1fr_390px]">
         {/* =================================================
             LEFT
         ================================================= */}
 
-        <div className="min-h-[500px] rounded-3xl border border-white/10 bg-white/[0.035] p-5 backdrop-blur-xl sm:p-6">
+        <div className="min-h-0 rounded-3xl border border-white/10 bg-white/[0.035] p-4 backdrop-blur-xl sm:min-h-[500px] sm:p-6">
           {/* =================================================
               LOBBY
           ================================================= */}
@@ -1901,12 +1941,39 @@ export default function RoomPage() {
                 "playing" &&
                 game.phase ===
                   "clue" && (
-                  <div className="mt-5 rounded-2xl border border-white/10 bg-black/10 p-5">
-                    <p className="text-xs uppercase tracking-[0.18em] text-white/25">
-                      Your clue
+                  <div className="mt-5 overflow-hidden rounded-3xl border border-violet-300/10 bg-gradient-to-br from-violet-400/[0.08] via-white/[0.025] to-fuchsia-400/[0.04] p-5 shadow-2xl shadow-violet-950/10">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-violet-200/50">
+                          Clue turn
+                        </p>
+                        <p className="mt-1 text-lg font-bold">
+                          {isMyClueTurn
+                            ? "Your turn! 🎯"
+                            : currentCluePlayer
+                              ? `${currentCluePlayer.name}'s turn`
+                              : "Waiting for the next player"}
+                        </p>
+                      </div>
+                      <div className="rounded-2xl bg-white/10 px-3 py-2 text-center">
+                        <div className="text-[9px] uppercase tracking-wider text-white/30">
+                          Clues
+                        </div>
+                        <div className="text-sm font-bold text-white/80">
+                          {game.clues.length}/{players.length}
+                        </div>
+                      </div>
+                    </div>
+
+                    <p className="mt-2 text-xs leading-5 text-white/35">
+                      {isMyClueTurn
+                        ? "Give a subtle clue. Everyone is watching 👀"
+                        : currentCluePlayer
+                          ? `Watch ${currentCluePlayer.name}. You'll get a turn after them.`
+                          : "The next turn will appear here."}
                     </p>
 
-                    <div className="mt-3 flex gap-2">
+                    <div className="mt-4 flex gap-2">
                       <input
                         value={clue}
                         onChange={(
@@ -1930,9 +1997,14 @@ export default function RoomPage() {
                           }
                         }}
                         disabled={
-                          hasSubmittedClue
+                          hasSubmittedClue ||
+                          !isMyClueTurn
                         }
-                        placeholder="Give a subtle clue..."
+                        placeholder={
+                          isMyClueTurn
+                            ? "Give a subtle clue..."
+                            : "Wait for your turn..."
+                        }
                         className="min-w-0 flex-1 rounded-xl border border-white/10 bg-white/[0.03] px-4 py-3 text-sm outline-none placeholder:text-white/20 focus:border-violet-300/20 disabled:opacity-40"
                       />
 
@@ -1945,7 +2017,8 @@ export default function RoomPage() {
                         }
                         disabled={
                           !clue.trim() ||
-                          hasSubmittedClue
+                          hasSubmittedClue ||
+                          !isMyClueTurn
                         }
                         className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-white text-[#0b0b12] disabled:opacity-20"
                       >
@@ -1954,10 +2027,8 @@ export default function RoomPage() {
                     </div>
 
                     {hasSubmittedClue && (
-                      <p className="mt-3 text-xs text-emerald-300/50">
-                        ✓ Clue submitted.
-                        Waiting for
-                        everyone else...
+                      <p className="mt-3 text-xs font-medium text-emerald-300/70">
+                        ✓ Clue submitted — watch the others!
                       </p>
                     )}
                   </div>
@@ -1978,6 +2049,7 @@ export default function RoomPage() {
                     {game.clues.map(
                       (
                         item,
+                        index,
                       ) => (
                         <motion.div
                           key={
@@ -1991,15 +2063,17 @@ export default function RoomPage() {
                             opacity: 1,
                             x: 0,
                           }}
-                          className="flex items-center justify-between gap-3 rounded-xl border border-white/5 bg-white/[0.025] px-4 py-3"
+                          className="flex items-center gap-3 rounded-2xl border border-white/5 bg-white/[0.025] px-4 py-3"
                         >
-                          <span className="text-sm font-medium text-violet-200/70">
-                            {
-                              item.playerName
-                            }
+                          <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-white/5 text-[10px] font-bold text-white/35">
+                            {index + 1}
                           </span>
 
-                          <span className="text-sm text-white/60">
+                          <span className="min-w-0 flex-1 text-sm font-medium text-violet-200/70">
+                            {item.playerName}
+                          </span>
+
+                          <span className="text-right text-sm text-white/60">
                             {item.clue}
                           </span>
                         </motion.div>
@@ -2139,11 +2213,23 @@ export default function RoomPage() {
                         submitVote
                       }
                       disabled={
-                        !selectedVote
+                        !selectedVote ||
+                        hasSubmittedVote
                       }
-                      className="mt-4 h-12 w-full rounded-xl bg-white font-semibold text-[#0b0b12] disabled:opacity-20"
+                      className={`mt-4 h-12 w-full rounded-xl font-semibold transition ${
+                        hasSubmittedVote
+                          ? "bg-emerald-300/15 text-emerald-200"
+                          : "bg-white text-[#0b0b12] disabled:opacity-20"
+                      }`}
                     >
-                      Submit Vote
+                      {hasSubmittedVote ? (
+                        <span className="flex items-center justify-center gap-2">
+                          <Check className="h-4 w-4" />
+                          Vote Submitted
+                        </span>
+                      ) : (
+                        "Submit Vote"
+                      )}
                     </motion.button>
                   </div>
                 )}
@@ -2294,7 +2380,10 @@ export default function RoomPage() {
 
           {/* Messages */}
 
-          <div className="flex-1 space-y-4 overflow-y-auto px-4 py-5">
+          <div
+            ref={chatScrollRef}
+            className="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain px-3 py-4 [scrollbar-width:thin] sm:space-y-4 sm:px-4 sm:py-5"
+          >
             {messages.length ===
               0 && (
               <div className="flex h-full min-h-[400px] items-center justify-center">
@@ -2326,18 +2415,8 @@ export default function RoomPage() {
 
                 if (system) {
                   return (
-                    <motion.div
-                      key={
-                        item.id
-                      }
-                      initial={{
-                        opacity: 0,
-                        y: 5,
-                      }}
-                      animate={{
-                        opacity: 1,
-                        y: 0,
-                      }}
+                    <div
+                      key={item.id}
                       className="py-1 text-center"
                     >
                       <span className="rounded-full border border-white/5 bg-white/[0.025] px-3 py-1 text-[10px] text-white/25">
@@ -2345,23 +2424,13 @@ export default function RoomPage() {
                           item.message
                         }
                       </span>
-                    </motion.div>
+                    </div>
                   );
                 }
 
                 return (
-                  <motion.div
-                    key={
-                      item.id
-                    }
-                    initial={{
-                      opacity: 0,
-                      y: 6,
-                    }}
-                    animate={{
-                      opacity: 1,
-                      y: 0,
-                    }}
+                  <div
+                    key={item.id}
                     className={`flex ${
                       mine
                         ? "justify-end"
@@ -2413,16 +2482,11 @@ export default function RoomPage() {
                         }
                       </div>
                     </div>
-                  </motion.div>
+                  </div>
                 );
               },
             )}
 
-            <div
-              ref={
-                chatEndRef
-              }
-            />
           </div>
 
           {/* Input */}
@@ -2430,30 +2494,8 @@ export default function RoomPage() {
           <div className="border-t border-white/10 p-3">
             <div className="flex items-center gap-2 rounded-2xl border border-white/10 bg-black/20 p-1.5 transition-colors focus-within:border-violet-300/20">
               <input
-                value={message}
-                onChange={(
-                  event,
-                ) =>
-                  setMessage(
-                    event.target.value.slice(
-                      0,
-                      300,
-                    ),
-                  )
-                }
-                onKeyDown={(
-                  event,
-                ) => {
-                  if (
-                    event.key ===
-                      "Enter" &&
-                    !event.shiftKey
-                  ) {
-                    event.preventDefault();
-
-                    sendMessage();
-                  }
-                }}
+                ref={messageInputRef}
+                maxLength={300}
                 placeholder={
                   game
                     ? "Chat during the game..."
@@ -2466,15 +2508,11 @@ export default function RoomPage() {
                 className="min-w-0 flex-1 bg-transparent px-3 py-2 text-sm text-white outline-none placeholder:text-white/20"
               />
 
-              <motion.button
-                whileTap={{
-                  scale: 0.9,
-                }}
+              <button
                 onClick={
                   sendMessage
                 }
                 disabled={
-                  !message.trim() ||
                   connection !==
                     "connected"
                 }
@@ -2482,7 +2520,7 @@ export default function RoomPage() {
                 aria-label="Send message"
               >
                 <Send className="h-4 w-4" />
-              </motion.button>
+              </button>
             </div>
           </div>
         </div>
